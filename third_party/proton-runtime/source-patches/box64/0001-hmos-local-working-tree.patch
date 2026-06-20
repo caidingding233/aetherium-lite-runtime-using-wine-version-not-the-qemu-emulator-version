@@ -1,0 +1,2563 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d0c38d8..a328288 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1351,6 +1351,37 @@ if(DYNAREC)
+ endif()
+ target_link_libraries(${BOX64} interpreter)
+ 
++if(BOX64_HMOS_INPROCESS)
++    target_compile_definitions(mainobj PRIVATE BOX64_HMOS_INPROCESS=1)
++    add_library(box64_hmos_core SHARED "${BOX64_ROOT}/src/hmos_inprocess.c")
++    target_compile_definitions(box64_hmos_core PRIVATE BOX64_HMOS_INPROCESS=1)
++    target_link_libraries(box64_hmos_core mainobj)
++    set_target_properties(box64_hmos_core PROPERTIES OUTPUT_NAME "box64_hmos_core")
++    set_target_properties(box64_hmos_core PROPERTIES ENABLE_EXPORTS ON)
++    add_dependencies(box64_hmos_core WRAPPERS)
++    if(BOX32)
++        add_dependencies(box64_hmos_core WRAPPERS32)
++    endif()
++    if(STATICBUILD)
++        target_link_libraries(box64_hmos_core c m dl pthread resolv util c)
++    else()
++        if(ANDROID)
++            if(TERMUX)
++                target_link_libraries(box64_hmos_core c m dl android-sysv-semaphore)
++            else()
++                target_link_libraries(box64_hmos_core c m dl libhilog_ndk.z.so)
++            endif()
++        else()
++            set_property(TARGET box64_hmos_core APPEND_STRING PROPERTY LINK_FLAGS "-Wl,--no-as-needed -lc -lm -ldl -lrt -lpthread -lresolv -lutil -Wl,--as-needed -pthread ")
++            target_link_libraries(box64_hmos_core c m dl pthread resolv util c)
++        endif()
++    endif()
++    if(DYNAREC)
++        target_link_libraries(box64_hmos_core dynarec)
++    endif()
++    target_link_libraries(box64_hmos_core interpreter)
++endif()
++
+ if(${CMAKE_VERSION} VERSION_LESS "3.13")
+     if(NOT NOLOADADDR)
+         if(CMAKE_C_COMPILER_ID STREQUAL "Clang" OR WITH_MOLD)
+diff --git a/src/box64context.c b/src/box64context.c
+index e6ad8f0..68a0d71 100644
+--- a/src/box64context.c
++++ b/src/box64context.c
+@@ -216,8 +216,22 @@ box64context_t *NewBox64Context(int argc)
+     context->exit_bridge = AddBridge(context->system, NULL, NULL, 0, NULL);
+     // get handle to box64 itself
+     #ifndef STATICBUILD
++    #ifdef BOX64_HMOS_INPROCESS
++    {
++        Dl_info self = {0};
++        if(dladdr((void*)NewBox64Context, &self) && self.dli_fname)
++            context->box64lib = dlopen(self.dli_fname, RTLD_NOW|RTLD_GLOBAL);
++        if(!context->box64lib)
++            context->box64lib = dlopen("libbox64_hmos_core.so", RTLD_NOW|RTLD_GLOBAL);
++        if(!context->box64lib)
++            context->box64lib = dlopen(NULL, RTLD_NOW|RTLD_GLOBAL);
++        printf_log(LOG_NONE, "HMOS box64 self handle %p from %s\n",
++            context->box64lib, (self.dli_fname && self.dli_fname[0]) ? self.dli_fname : "<fallback>");
++    }
++    #else
+     context->box64lib = dlopen(NULL, RTLD_NOW|RTLD_GLOBAL);
+     #endif
++    #endif
+     context->dlprivate = NewDLPrivate();
+ 
+     context->argc = argc;
+@@ -480,4 +494,3 @@ int AddTLSPartition(box64context_t* context, int tlssize) {
+ 
+     return -context->tlssize;   // negative offset
+ }
+-
+diff --git a/src/core.c b/src/core.c
+index 5b91cf3..6b28faa 100644
+--- a/src/core.c
++++ b/src/core.c
+@@ -24,6 +24,10 @@
+ #include <fcntl.h>
+ #endif
+ 
++#define LOG_DOMAIN 0x2330
++#define LOG_TAG "Box64Core"
++#include "hilog/log.h"
++
+ #include "os.h"
+ #include "build_info.h"
+ #include "debug.h"
+@@ -97,6 +101,22 @@ FILE* ftrace = NULL;
+ char* ftrace_name = NULL;
+ int ftrace_opened = 0;
+ 
++#ifdef BOX64_HMOS_INPROCESS
++static int hmos_path_has_suffix(const char* path, const char* suffix)
++{
++    if(!path || !suffix)
++        return 0;
++    size_t path_len = strlen(path);
++    size_t suffix_len = strlen(suffix);
++    return path_len >= suffix_len && !strcmp(path + path_len - suffix_len, suffix);
++}
++
++static int hmos_allows_nonexec_target(const char* path)
++{
++    return hmos_path_has_suffix(path, ".so");
++}
++#endif
++
+ 
+ static void openFTrace(void)
+ {
+@@ -767,10 +787,26 @@ extern char** environ;
+ 
+ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elfheader_t** elfheader, int exec)
+ {
++#ifdef BOX64_HMOS_INPROCESS
++#define HMOS_INIT_LOG(...) do { OH_LOG_ERROR(LOG_APP, __VA_ARGS__); } while(0)
++#else
++#define HMOS_INIT_LOG(...) do { if(!exec) OH_LOG_INFO(LOG_APP, __VA_ARGS__); } while(0)
++#endif
++    HMOS_INIT_LOG("initialize begin argc=%{public}d argv0=%{public}s argv1=%{public}s", argc,
++        (argc > 0 && argv && argv[0]) ? argv[0] : "<null>",
++        (argc > 1 && argv && argv[1]) ? argv[1] : "<null>");
++#ifdef BOX64_HMOS_INPROCESS
++    OH_LOG_ERROR(LOG_APP, "initialize hmos marker 20260618 argc=%{public}d argv0=%{public}s argv1=%{public}s",
++        argc,
++        (argc > 0 && argv && argv[0]) ? argv[0] : "<null>",
++        (argc > 1 && argv && argv[1]) ? argv[1] : "<null>");
++#endif
+ #ifndef STATICBUILD
+     init_malloc_hook();
+ #endif
++    HMOS_INIT_LOG("initialize after malloc hook");
+     init_auxval(argc, argv, environ?environ:env);
++    HMOS_INIT_LOG("initialize after auxval");
+     ftrace = stderr;    // init early: BOX64_VERSION path below uses PrintfFtrace
+     // analogue to QEMU_VERSION in qemu-user-mode emulation
+     if(getenv("BOX64_VERSION")) {
+@@ -815,6 +851,7 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
+ 
+     LoadEnvVariables();
+     InitializeEnvFiles();
++    HMOS_INIT_LOG("initialize after env load");
+ 
+     const char* prog = argv[1];
+     int nextarg = 1;
+@@ -867,8 +904,10 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
+ 
+     InitializeSystemInfo();
+     displayMiscInfo();
++    HMOS_INIT_LOG("initialize after system info prog=%{public}s", prog ? prog : "<null>");
+ 
+     hookMangoHud();
++    HMOS_INIT_LOG("initialize after mangohud hook");
+ 
+     char* bashpath = NULL;
+     {
+@@ -919,11 +958,14 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
+     // check if this is wine
+     if(!strcmp(prog_, "wine64")
+      || !strcmp(prog_, "wine64-development")
+-     || !strcmp(prog_, "wine")) {
++     || !strcmp(prog_, "wine")
++     || !strcmp(prog_, "wine-hmos-loader.so")) {
+         const char* prereserve = getenv("WINEPRELOADRESERVE");
+         printf_log(LOG_INFO, "Wine64 detected, WINEPRELOADRESERVE=\"%s\"\n", prereserve?prereserve:"");
+         if(wine_preloaded || 1) {
++            HMOS_INIT_LOG("initialize before wine_prereserve value=%{public}s", prereserve ? prereserve : "");
+             wine_prereserve(prereserve);
++            HMOS_INIT_LOG("initialize after wine_prereserve");
+         }
+         // special case for winedbg, doesn't work anyway
+         if(argv[nextarg+1] && strstr(argv[nextarg+1], "winedbg")==argv[nextarg+1]) {
+@@ -976,9 +1018,12 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
+         box64_wine = 1;
+     }
+     // Create a new context
++    HMOS_INIT_LOG("initialize before NewBox64Context argc_next=%{public}d", argc - nextarg);
+     my_context = NewBox64Context(argc - nextarg);
++    HMOS_INIT_LOG("initialize after NewBox64Context ctx=%{public}p", my_context);
+ 
+     addLibPaths(my_context);
++    HMOS_INIT_LOG("initialize after addLibPaths");
+     if(box64_wine) {
+         // check if it's proton, with it's custom gstreamer build, to disable gtk3 loading
+         char* tmp_ = ResolveFile(prog_, &my_context->box64_path);
+@@ -1011,6 +1056,7 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
+         AddPath("libwayland-client.so.0", &my_context->box64_emulated_libs, 0);
+ 
+     my_context->box64path = ResolveFile(argv[0], &my_context->box64_path);
++    HMOS_INIT_LOG("initialize after ResolveFile box64path=%{public}s", my_context->box64path ? my_context->box64path : "<null>");
+     // prepare all other env. var
+     my_context->envc = CountEnv(environ?environ:env);
+     printf_log(LOG_INFO, "Counted %d Env var\n", my_context->envc);
+@@ -1068,14 +1114,20 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
+         my_context->argv[0] = box_strdup(prog);
+     else
+         my_context->argv[0] = ResolveFileSoft(prog, &my_context->box64_path);
++    HMOS_INIT_LOG("initialize argv0 prepared=%{public}s", my_context->argv[0] ? my_context->argv[0] : "<null>");
+     //
+     GatherEnv(&my_context->envv, environ?environ:env, my_context->argv[0]);
++    HMOS_INIT_LOG("initialize after GatherEnv envc=%{public}d", my_context->envc);
+     if (BOX64ENV(dump) || BOX64ENV(log)<=LOG_DEBUG) {
+         for (int i=0; i<my_context->envc; ++i)
+             printf_dump(LOG_DEBUG, " Env[%02d]: %s\n", i, my_context->envv[i]);
+     }
+     // check if box86 is present
+     {
++        #ifdef BOX64_HMOS_INPROCESS
++        if(!my_context->box64path)
++            my_context->box64path = box_strdup(argv[0] ? argv[0] : "box64-hmos-inprocess");
++        #endif
+         my_context->box86path = box_strdup(my_context->box64path);
+         #ifndef BOX32
+         if(strstr(my_context->box86path, "box64")) {
+@@ -1142,12 +1194,15 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
+         displayMiscInfo();
+         PrintEnvVariables(&box64env, LOG_INFO);
+     }
++    HMOS_INIT_LOG("initialize before setupZydis");
+     setupZydis(my_context);
++    HMOS_INIT_LOG("initialize after setupZydis");
+ 
+     for(int i=1; i<my_context->argc; ++i) {
+         my_context->argv[i] = box_strdup(argv[i+nextarg]);
+         printf_log(LOG_INFO, "argv[%i]=\"%s\"\n", i, my_context->argv[i]);
+     }
++    HMOS_INIT_LOG("initialize after argv copy argc=%{public}d", my_context->argc);
+ 
+     // Setup custom bash rcfile iff no args are present
+     if (setup_bash_rcfile && my_context->argc == 1) {
+@@ -1214,19 +1269,36 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
+         }
+     }
+     // check if file exist
++    HMOS_INIT_LOG("initialize before file check argv0=%{public}s", my_context->argv[0] ? my_context->argv[0] : "<null>");
+     if(!my_context->argv[0] || !FileExist(my_context->argv[0], IS_FILE)) {
++#ifdef BOX64_HMOS_INPROCESS
++        OH_LOG_ERROR(LOG_APP, "initialize file check failed argv0=%{public}s", my_context->argv[0] ? my_context->argv[0] : "<null>");
++#endif
+         printf_log(LOG_NONE, "Error: File is not found. (%s)\n", my_context->argv[0]);
+         free_contextargv();
+         FreeBox64Context(&my_context);
+         FreeCollection(&ld_preload);
+         return -1;
+     }
+-    if(!FileExist(my_context->argv[0], IS_FILE|IS_EXECUTABLE)) {
++    if(exec && !FileExist(my_context->argv[0], IS_FILE|IS_EXECUTABLE)) {
++#ifdef BOX64_HMOS_INPROCESS
++        if(hmos_allows_nonexec_target(my_context->argv[0])) {
++            OH_LOG_WARN(LOG_APP, "initialize allowing non-executable guest SO argv0=%{public}s", my_context->argv[0]);
++        } else {
++            OH_LOG_ERROR(LOG_APP, "initialize executable check failed argv0=%{public}s", my_context->argv[0]);
++            printf_log(LOG_NONE, "Error: %s is not an executable file.\n", my_context->argv[0]);
++            free_contextargv();
++            FreeBox64Context(&my_context);
++            FreeCollection(&ld_preload);
++            return -1;
++        }
++#else
+         printf_log(LOG_NONE, "Error: %s is not an executable file.\n", my_context->argv[0]);
+         free_contextargv();
+         FreeBox64Context(&my_context);
+         FreeCollection(&ld_preload);
+         return -1;
++#endif
+     }
+     if(!(my_context->fullpath = box_realpath(my_context->argv[0], NULL)))
+         my_context->fullpath = box_strdup(my_context->argv[0]);
+@@ -1242,6 +1314,7 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
+         FreeCollection(&ld_preload);
+         return -1;
+     }
++    HMOS_INIT_LOG("initialize opened elf fullpath=%{public}s", my_context->fullpath ? my_context->fullpath : "<null>");
+     #ifdef BOX32
+     box64_is32bits = FileIsX86ELF(my_context->fullpath);
+     // try to switch personality, but only if not already tried
+@@ -1278,12 +1351,14 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
+     }
+     #endif
+     LoadLDPath(my_context);
++    HMOS_INIT_LOG("initialize after LoadLDPath");
+     my_context->video_mem = mmap((void*)0xb0000, 0x10000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+     if(my_context->video_mem != (void*)0xb0000) {
+         my_context->video_mem = NULL;
+         printf_log(LOG_INFO, "Warning, could not allocate text video memory");
+     }
+-    elfheader_t *elf_header = LoadAndCheckElfHeader(f, my_context->fullpath, 1);
++    elfheader_t *elf_header = LoadAndCheckElfHeader(f, my_context->fullpath, exec);
++    HMOS_INIT_LOG("initialize after LoadAndCheckElfHeader elf=%{public}p", elf_header);
+     if(!elf_header) {
+         int x86 = my_context->box86path?FileIsX86ELF(my_context->fullpath):0;
+         int script = my_context->bashpath?FileIsShell(my_context->fullpath):0;
+@@ -1327,6 +1402,7 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
+     }
+     AddElfHeader(my_context, elf_header);
+     *elfheader = elf_header;
++    HMOS_INIT_LOG("initialize after AddElfHeader");
+ 
+     if(CalcLoadAddr(elf_header)) {
+         printf_log(LOG_NONE, "Error: Reading elf header of %s\n", my_context->fullpath);
+@@ -1337,6 +1413,7 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
+         return -1;
+     }
+     // allocate memory and load elf
++    HMOS_INIT_LOG("initialize before AllocLoadElfMemory");
+     if(AllocLoadElfMemory(my_context, elf_header, 1)) {
+         printf_log(LOG_NONE, "Error: Loading elf %s\n", my_context->fullpath);
+         FreeElfHeader(&elf_header);
+@@ -1345,6 +1422,7 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
+         FreeCollection(&ld_preload);
+         return -1;
+     }
++    HMOS_INIT_LOG("initialize after AllocLoadElfMemory");
+     if (!strcmp(box64_guest_name, "heroic")) {
+         // check if heroic needs patching (for the 2.15.1 version)
+         uint8_t* address = GetBaseAddress(elf_header);
+@@ -1412,6 +1490,7 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
+ #endif
+     // change process name
+     {
++        HMOS_INIT_LOG("initialize before process rename");
+         char* p = strrchr(my_context->fullpath, '/');
+         if(p)
+             ++p;
+@@ -1424,6 +1503,11 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
+         if (strcmp(box64_guest_name, p)) {
+             ApplyEnvFileEntry(p);
+         }
++#ifdef BOX64_HMOS_INPROCESS
++        my_context->orig_argc = my_context->argc;
++        my_context->orig_argv = my_context->argv;
++        HMOS_INIT_LOG("initialize skipped host argv rewrite for hmos in-process");
++#else
+         // and now all change the argv (so libs libs mesa find the correct program names)
+         char* endp = (char*)argv[argc-1];
+         while(*endp)
+@@ -1436,7 +1520,9 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
+             argv[i] -= diff;    // adjust strings
+         my_context->orig_argc = argc;
+         my_context->orig_argv = (char**)argv;
++#endif
+     }
++    HMOS_INIT_LOG("initialize after process rename");
+     box64_nolibs = (NeededLibs(elf_header)==0);
+     if(box64_nolibs) printf_log(LOG_INFO, "Warning, box64 is not really compatible with staticaly linked binaries. Expect crash!\n");
+     box64_isglibc234 = GetNeededVersionForLib(elf_header, "libc.so.6", "GLIBC_2.34");
+@@ -1450,11 +1536,14 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
+         FreeCollection(&ld_preload);
+         return -1;
+     }
++    HMOS_INIT_LOG("initialize after CalcStackSize");
+     // init x86_64 emu
+     x64emu_t *emu = NewX64Emu(my_context, my_context->ep, (uintptr_t)my_context->stack, my_context->stacksz, 0);
++    HMOS_INIT_LOG("initialize after NewX64Emu emu=%{public}p", emu);
+     // stack setup is much more complicated then just that!
+     SetupInitialStack(emu); // starting here, the argv[] don't need free anymore
+     SetupX64Emu(emu, NULL);
++    HMOS_INIT_LOG("initialize after SetupX64Emu");
+     if(box64_is32bits) {
+         SetEAX(emu, my_context->argc);
+         SetEBX(emu, my_context->argv32);
+@@ -1509,8 +1598,10 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
+         FreeBox64Context(&my_context);
+         return -1;
+     }
++    HMOS_INIT_LOG("initialize after LoadNeededLibs");
+     // reloc...
+     printf_log(LOG_DEBUG, "And now export symbols / relocation for %s...\n", ElfName(elf_header));
++    HMOS_INIT_LOG("initialize before RelocateElf");
+     if(RelocateElf(my_context->maplib, NULL, 0, 0, elf_header)) {
+         printf_log(LOG_NONE, "Error: Relocating symbols in elf %s\n", my_context->argv[0]);
+         FreeBox64Context(&my_context);
+diff --git a/src/custommem.c b/src/custommem.c
+index d148740..d00d4c2 100644
+--- a/src/custommem.c
++++ b/src/custommem.c
+@@ -3,6 +3,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <errno.h>
++#include <unistd.h>
+ 
+ #include "os.h"
+ #include "backtrace.h"
+@@ -3316,6 +3317,59 @@ void getLockAddressRange(uintptr_t start, size_t size, uintptr_t addrs[])
+ #ifndef MAP_32BIT
+ #define MAP_32BIT 0x40
+ #endif
++#ifdef BOX64_HMOS_INPROCESS
++static int hmos_guest_host_prot(int prot)
++{
++    int host_prot = prot & ~PROT_EXEC;
++    if ((prot & PROT_EXEC) && !(host_prot & PROT_READ))
++        host_prot |= PROT_READ;
++    return host_prot;
++}
++
++static void* hmos_fixed_private_file_mmap(void *addr, size_t length, int prot, int flags, int fd, ssize_t offset, int first_errno)
++{
++    if (!addr || fd < 0 || (flags & MAP_ANONYMOUS) || !(flags & MAP_FIXED) || !(flags & MAP_PRIVATE) ||
++        (flags & MAP_FIXED_NOREPLACE))
++        return MAP_FAILED;
++    if (!have48bits && ((uintptr_t)addr > 0x7fffffffffULL || length > (0x7fffffffffULL - (uintptr_t)addr)))
++        return MAP_FAILED;
++
++    const int host_prot = hmos_guest_host_prot(prot);
++    const int map_prot = hmos_guest_host_prot(prot | PROT_READ | PROT_WRITE);
++    const int anon_flags = (flags | MAP_ANONYMOUS | MAP_PRIVATE) & ~MAP_FIXED_NOREPLACE;
++    InternalMunmap(addr, length);
++    void *ret = InternalMmap(addr, length, map_prot, anon_flags, -1, 0);
++    if (ret == MAP_FAILED)
++        return MAP_FAILED;
++
++    size_t done = 0;
++    while (done < length) {
++        ssize_t got = pread(fd, (char*)ret + done, length - done, offset + done);
++        if (got > 0) {
++            done += got;
++            continue;
++        }
++        if (got == 0) break;
++        if (errno == EINTR) continue;
++        int read_errno = errno;
++        InternalMunmap(ret, length);
++        errno = read_errno;
++        return MAP_FAILED;
++    }
++
++    if (mprotect(ret, length, host_prot) != 0) {
++        int protect_errno = errno;
++        InternalMunmap(ret, length);
++        errno = protect_errno;
++        return MAP_FAILED;
++    }
++    setProtection_mmap((uintptr_t)ret, length, prot);
++
++    printf_log(LOG_INFO, "HMOS MAP_FIXED private file fallback mapped addr=%p len=0x%zx prot=0x%x flags=0x%x first_errno=%d copied=0x%zx\n",
++        addr, length, prot, flags, first_errno, done);
++    return ret;
++}
++#endif
+ EXPORT void* box_mmap(void *addr, size_t length, int prot, int flags, int fd, ssize_t offset)
+ {
+     if(prot&PROT_WRITE)
+@@ -3332,7 +3386,30 @@ EXPORT void* box_mmap(void *addr, size_t length, int prot, int flags, int fd, ss
+             addr = find47bitBlock(length);
+     }
+     #endif
+-    void* ret = InternalMmap(addr, length, prot, new_flags, fd, offset);
++#ifdef BOX64_HMOS_INPROCESS
++    int host_prot = hmos_guest_host_prot(prot);
++#else
++    int host_prot = prot;
++#endif
++    void* ret = InternalMmap(addr, length, host_prot, new_flags, fd, offset);
++#ifdef BOX64_HMOS_INPROCESS
++    if(ret==MAP_FAILED && addr && (new_flags&MAP_FIXED) && !(new_flags&MAP_FIXED_NOREPLACE) &&
++       (have48bits || ((uintptr_t)addr <= 0x7fffffffffULL && length <= (0x7fffffffffULL - (uintptr_t)addr)))) {
++        int first_errno = errno;
++        InternalMunmap(addr, length);
++        ret = InternalMmap(addr, length, host_prot, new_flags, fd, offset);
++        if(ret!=MAP_FAILED) {
++            printf_log(LOG_DEBUG, "HMOS MAP_FIXED retry succeeded addr=%p len=0x%zx prot=0x%x flags=0x%x first_errno=%d\n",
++                addr, length, prot, new_flags, first_errno);
++        } else {
++            ret = hmos_fixed_private_file_mmap(addr, length, prot, new_flags, fd, offset, first_errno);
++        }
++        if(ret==MAP_FAILED) {
++            printf_log(LOG_INFO, "HMOS MAP_FIXED retry failed addr=%p len=0x%zx prot=0x%x flags=0x%x first_errno=%d retry_errno=%d\n",
++                addr, length, prot, new_flags, first_errno, errno);
++        }
++    }
++#endif
+ #if !defined(NOALIGN)
+     if((ret!=MAP_FAILED) && (flags&MAP_32BIT) &&
+       (((uintptr_t)ret>0xffffffffLL) || ((box64_wine) && ((uintptr_t)ret&0xffff) && (ret!=addr)))) {
+diff --git a/src/elfs/elfloader.c b/src/elfs/elfloader.c
+index 0e5c14a..2230d17 100644
+--- a/src/elfs/elfloader.c
++++ b/src/elfs/elfloader.c
+@@ -15,6 +15,12 @@
+ #include <dlfcn.h>
+ #endif
+ 
++#ifdef BOX64_HMOS
++#define LOG_DOMAIN 0x2330
++#define LOG_TAG "Box64Core"
++#include "hilog/log.h"
++#endif
++
+ #include "os.h"
+ #include "custommem.h"
+ #include "box64version.h"
+@@ -54,6 +60,21 @@ void* my__IO_2_1_stdout_ = (void*)3;
+ 
+ uintptr_t pltResolver64 = ~0LL;
+ 
++#ifdef BOX64_HMOS_INPROCESS
++static int hmos_host_mmap_prot(uint32_t prot)
++{
++    int host_prot = (int)(prot & ~PROT_EXEC & ~PROT_CUSTOM);
++    if((prot & PROT_EXEC) && !(host_prot & PROT_READ))
++        host_prot |= PROT_READ;
++    return host_prot;
++}
++#else
++static int hmos_host_mmap_prot(uint32_t prot)
++{
++    return (int)(prot & ~PROT_CUSTOM);
++}
++#endif
++
+ // return the index of header (-1 if it doesn't exist)
+ static int getElfIndex(box64context_t* ctx, elfheader_t* head) {
+     for (int i=0; i<ctx->elfsize; ++i)
+@@ -321,7 +342,7 @@ int AllocLoadElfMemory(box64context_t* context, elfheader_t* head, int mainbin)
+                 void* p = InternalMmap(
+                     (void*)head->multiblocks[n].paddr,
+                     head->multiblocks[n].size,
+-                    prot,
++                    hmos_host_mmap_prot(prot),
+                     MAP_PRIVATE|MAP_FIXED, //((prot&PROT_WRITE)?MAP_SHARED:MAP_PRIVATE)|MAP_FIXED,
+                     head->fileno,
+                     e->p_offset
+@@ -346,7 +367,7 @@ int AllocLoadElfMemory(box64context_t* context, elfheader_t* head, int mainbin)
+                     p = InternalMmap(
+                         (void*)paddr,
+                         asize,
+-                        prot|PROT_WRITE,
++                        hmos_host_mmap_prot(prot|PROT_WRITE),
+                         MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,
+                         -1,
+                         0
+@@ -369,7 +390,7 @@ int AllocLoadElfMemory(box64context_t* context, elfheader_t* head, int mainbin)
+                         p = InternalMmap(
+                             (void*)new_addr,
+                             ALIGN(new_size),
+-                            prot|PROT_WRITE,
++                            hmos_host_mmap_prot(prot|PROT_WRITE),
+                             MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,
+                             -1,
+                             0
+@@ -436,7 +457,7 @@ int AllocLoadElfMemory(box64context_t* context, elfheader_t* head, int mainbin)
+             for(uintptr_t page = start; page < end; page += box64_pagesize) {
+                 uint32_t prot = getProtection(page);
+                 if(prot && !(prot & PROT_WRITE))
+-                    mprotect((void*)page, box64_pagesize, prot & ~PROT_CUSTOM);
++                    mprotect((void*)page, box64_pagesize, hmos_host_mmap_prot(prot));
+             }
+         }
+     }
+@@ -1635,11 +1656,11 @@ void PatchLoadedDynamicSection(elfheader_t* h)
+     for(uintptr_t page = page_addr; page < page_end; page += box64_pagesize) {
+         uint32_t old_prot = getProtection(page);
+         if(old_prot && !(old_prot & PROT_WRITE)) {
+-            if(mprotect((void*)page, box64_pagesize, (old_prot | PROT_WRITE) & ~PROT_CUSTOM)) {
++            if(mprotect((void*)page, box64_pagesize, hmos_host_mmap_prot(old_prot | PROT_WRITE))) {
+                 for(uintptr_t restore = page_addr; restore < page; restore += box64_pagesize) {
+                     uint32_t restore_prot = getProtection(restore);
+                     if(restore_prot && !(restore_prot & PROT_WRITE))
+-                        mprotect((void*)restore, box64_pagesize, restore_prot & ~PROT_CUSTOM);
++                        mprotect((void*)restore, box64_pagesize, hmos_host_mmap_prot(restore_prot));
+                 }
+                 return;
+             }
+@@ -1667,7 +1688,7 @@ void PatchLoadedDynamicSection(elfheader_t* h)
+         for(uintptr_t page = page_addr; page < page_end; page += box64_pagesize) {
+             uint32_t old_prot = getProtection(page);
+             if(old_prot && !(old_prot & PROT_WRITE))
+-                mprotect((void*)page, box64_pagesize, old_prot & ~PROT_CUSTOM);
++                mprotect((void*)page, box64_pagesize, hmos_host_mmap_prot(old_prot));
+         }
+     }
+ 
+@@ -2108,6 +2129,11 @@ EXPORT void PltResolver64(x64emu_t* emu)
+     }
+     if (!offs) {
+         printf_log(LOG_NONE, "Error: PltResolver: Symbol %s%s(%sver %d: %s%s%s) not found, cannot apply R_X86_64_JUMP_SLOT %p in %s (local_maplib=%p, global maplib=%p, deepbind=%d)\n", (bind==STB_LOCAL)?"Local ":((bind==STB_WEAK)?"Weak ":""), symname, veropt?"opt":"", version, symname, vername?"@":"", vername?vername:"", p, (h && h->name)?h->name:"???", local_maplib, my_context->maplib, deepbind);
++#ifdef BOX64_HMOS
++        OH_LOG_ERROR(LOG_APP, "HMOS PltResolver missing symbol=%{public}s version=%{public}s elf=%{public}s bind=%{public}d local=%{public}p global=%{public}p deepbind=%{public}d",
++            symname ? symname : "<null>", vername ? vername : "<none>", (h && h->name) ? h->name : "???",
++            bind, local_maplib, my_context ? my_context->maplib : NULL, deepbind);
++#endif
+         emu->quit = 1;
+         R_RIP = 0; //stop....
+         return;
+diff --git a/src/emu/x64printer.c b/src/emu/x64printer.c
+index fd8884b..22c6f0b 100644
+--- a/src/emu/x64printer.c
++++ b/src/emu/x64printer.c
+@@ -2071,6 +2071,8 @@ void x64Print(x64emu_t* emu, char* buff, size_t buffsz, const char* func, int ti
+         snprintf(buff, buffsz, "%04d|%p: Calling %s(%" PRIi32 ", %" PRIi32 ", %" PRIu32 ")", tid, *(void**)(R_RSP), func, (int32_t)R_RDI, (int32_t)R_RSI, (uint32_t)R_RDX);
+     } else if (w == iFEiip) {
+         snprintf(buff, buffsz, "%04d|%p: Calling %s(%" PRIi32 ", %" PRIi32 ", %" PRIp ")", tid, *(void**)(R_RSP), func, (int32_t)R_RDI, (int32_t)R_RSI, (void*)R_RDX);
++    } else if (w == iFEipi) {
++        snprintf(buff, buffsz, "%04d|%p: Calling %s(%" PRIi32 ", %" PRIp ", %" PRIi32 ")", tid, *(void**)(R_RSP), func, (int32_t)R_RDI, (void*)R_RSI, (int32_t)R_RDX);
+     } else if (w == iFEipp) {
+         snprintf(buff, buffsz, "%04d|%p: Calling %s(%" PRIi32 ", %" PRIp ", %" PRIp ")", tid, *(void**)(R_RSP), func, (int32_t)R_RDI, (void*)R_RSI, (void*)R_RDX);
+     } else if (w == iFEipV) {
+diff --git a/src/emu/x64syscall.c b/src/emu/x64syscall.c
+index 483941d..f00c9a8 100644
+--- a/src/emu/x64syscall.c
++++ b/src/emu/x64syscall.c
+@@ -22,6 +22,12 @@
+ #include <sys/prctl.h>
+ #include <poll.h>
+ #include <sys/epoll.h>
++#include <pthread.h>
++#ifdef BOX64_HMOS
++#define LOG_DOMAIN 0x2330
++#define LOG_TAG "Box64Core"
++#include "hilog/log.h"
++#endif
+ 
+ #include "x64_signals.h"
+ #include "os.h"
+@@ -38,6 +44,72 @@
+ #include "callback.h"
+ #include "signals.h"
+ #include "emit_signals.h"
++#include "elfloader.h"
++#include "librarian.h"
++
++extern int box64_hmos_inprocess_mode __attribute__((weak));
++static int hmos_inprocess_is_active(void)
++{
++    return &box64_hmos_inprocess_mode && box64_hmos_inprocess_mode;
++}
++
++static void hmos_safe_thread_exit(int ret)
++{
++    if(hmos_inprocess_is_active())
++        pthread_exit((void*)(intptr_t)ret);
++    _exit(ret);
++}
++
++static int hmos_signal_is_process_fatal(long sig)
++{
++    return sig == SIGABRT || sig == SIGSEGV || sig == SIGILL || sig == SIGBUS || sig == SIGFPE || sig == SIGKILL || sig == SIGTERM;
++}
++
++static int hmos_should_block_signal_syscall(uint32_t syscall_id, long a0, long a1, long a2)
++{
++    if(!hmos_inprocess_is_active())
++        return 0;
++    const pid_t pid = getpid();
++    const pid_t tid = GetTID();
++    if(syscall_id == 62) { // kill(pid, sig)
++        return (a0 == pid || a0 == 0 || a0 == -1) && hmos_signal_is_process_fatal(a1);
++    }
++    if(syscall_id == 200) { // tkill(tid, sig)
++        return (a0 == tid || a0 == pid) && hmos_signal_is_process_fatal(a1);
++    }
++    if(syscall_id == 234) { // tgkill(tgid, tid, sig)
++        return (a0 == pid || a0 == -1) && (a1 == tid || a1 == pid) && hmos_signal_is_process_fatal(a2);
++    }
++    return 0;
++}
++
++static void hmos_ensure_wine_sigsys_handler(void)
++{
++#ifdef BOX64_HMOS
++    static int miss_logged = 0;
++    if(!hmos_inprocess_is_active() || box64_is32bits || !my_context || my_context->signals[X64_SIGSYS])
++        return;
++
++    uintptr_t start = 0;
++    uintptr_t end = 0;
++    elfheader_t* ntdll_elf = NULL;
++    if(my_context->signals[X64_SIGSEGV] > 2)
++        ntdll_elf = FindElfAddress(my_context, my_context->signals[X64_SIGSEGV]);
++
++    if((ntdll_elf && ElfGetSymTabStartEnd(ntdll_elf, &start, &end, "sigsys_handler"))
++            || GetSymTabStartEnd(my_context->maplib, "sigsys_handler", &start, &end)) {
++        my_context->signals[X64_SIGSYS] = start;
++        my_context->is_sigaction[X64_SIGSYS] = 1;
++        my_context->restorer[X64_SIGSYS] = 0;
++        my_context->onstack[X64_SIGSYS] = 1;
++        OH_LOG_WARN(LOG_APP, "HMOS Wine fallback registered SIGSYS handler=0x%{public}lx end=0x%{public}lx elf=%{public}s",
++            (unsigned long)start, (unsigned long)end, ntdll_elf ? ElfName(ntdll_elf) : "<global>");
++    } else if(!miss_logged) {
++        miss_logged = 1;
++        OH_LOG_WARN(LOG_APP, "HMOS Wine fallback could not locate sigsys_handler");
++    }
++#endif
++}
+ #include "x64tls.h"
+ #include "elfloader.h"
+ #include "x64int_private.h"
+@@ -487,21 +559,49 @@ static int clone_fn_syscall(void* arg)
+         my_context->stack_clone_used = 0;
+     if(stack2free)
+         box_free(stack2free);   // this free the stack, so it will crash very soon!
+-    _exit(ret);
++    hmos_safe_thread_exit(ret);
+ }
+ 
+ void EXPORT x64Syscall(x64emu_t *emu)
+ {
+     // check if it's a wine process, then filter the syscall (simulate SECCMP)
+     // Wine uses SUD (syscall user dispatch) since 11.5, bypass this hack if SUD is effective
+-    if(box64_wine && !box64_is32bits && (!emu || !emu->sud_enabled)) {
++    int hmos_wine_syscall = hmos_inprocess_is_active() && !box64_is32bits;
++    if((box64_wine || hmos_wine_syscall) && !box64_is32bits && (!emu || !emu->sud_enabled || hmos_wine_syscall)) {
+         //64bits only here...
+         uintptr_t ret_addr = R_RIP-2;
+-        if(/*ret_addr<0x700000000000LL &&*/ (my_context->signals[X64_SIGSYS]>2) && !FindElfAddress(my_context, ret_addr)) {
++        elfheader_t *ret_elf = FindElfAddress(my_context, ret_addr);
++        if(!ret_elf && (hmos_wine_syscall || (my_context->signals[X64_SIGSYS]>2))) {
+             // not a linux elf, not a syscall to setup x86_64 arch. Signal SIGSYS
++            if(hmos_wine_syscall)
++                hmos_ensure_wine_sigsys_handler();
++#ifdef BOX64_HMOS
++            static int hmos_sigsys_log_count = 0;
++            if(hmos_sigsys_log_count < 32) {
++                OH_LOG_WARN(LOG_APP, "HMOS Wine fallback SIGSYS syscall=%{public}u ret_addr=0x%{public}llx rip=0x%{public}llx handler=0x%{public}lx sud=%{public}u",
++                    (unsigned)(R_EAX & 0xffff),
++                    (unsigned long long)ret_addr,
++                    (unsigned long long)R_RIP,
++                    (unsigned long)my_context->signals[X64_SIGSYS],
++                    emu ? emu->sud_enabled : 0);
++            } else if(hmos_sigsys_log_count == 32) {
++                OH_LOG_WARN(LOG_APP, "HMOS Wine fallback SIGSYS further logs suppressed");
++            }
++            hmos_sigsys_log_count++;
++#endif
+             EmitSignal(emu, X64_SIGSYS, (void*)ret_addr, R_EAX&0xffff);  // what are the parameters?
+             return;
+         }
++#ifdef BOX64_HMOS
++        if(hmos_wine_syscall && !ret_elf) {
++            OH_LOG_WARN(LOG_APP, "HMOS Wine fallback SIGSYS skipped syscall=%{public}u ret_addr=0x%{public}llx handler=0x%{public}lx sud=%{public}u wine=%{public}d",
++                (unsigned)(R_EAX & 0xffff),
++                (unsigned long long)ret_addr,
++                (unsigned long)my_context->signals[X64_SIGSYS],
++                emu ? emu->sud_enabled : 0,
++                box64_wine);
++        }
++#endif
+     }
+     return x64Syscall_linux(emu);
+ }
+@@ -531,6 +631,24 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
+         S_RAX = my_syscall_user_dispatch_prctl(emu, R_RSI, R_RDX, R_R10, (void*)R_R8);
+         return;
+     }
++    if(hmos_inprocess_is_active() && (s == 60 || s == 231)) {
++        emu->quit = 1;
++        emu->exit = 1;
++        S_RAX = R_RDI;
++        OH_LOG_WARN(LOG_APP, "HMOS in-process blocked guest exit syscall %{public}u code=%{public}lld",
++            s, (long long)R_RDI);
++        if(log) snprintf(buffret, 127, "0x%x [hmos blocked host exit syscall %d]", R_EAX, s);
++        if(log && !BOX64ENV(rolling_log)) printf_log_prefix(0, LOG_NONE, "=> %s\n", buffret);
++        return;
++    }
++    if(hmos_should_block_signal_syscall(s, R_RDI, R_RSI, R_RDX)) {
++        emu->quit = 1;
++        S_RAX = 0;
++        OH_LOG_WARN(LOG_APP, "HMOS in-process blocked guest fatal signal syscall %{public}u", s);
++        if(log) snprintf(buffret, 127, "0x%x [hmos blocked host fatal signal syscall %d]", R_EAX, s);
++        if(log && !BOX64ENV(rolling_log)) printf_log_prefix(0, LOG_NONE, "=> %s\n", buffret);
++        return;
++    }
+     // check wrapper first
+     uint32_t cnt = sizeof(syscallwrap) / sizeof(scwrap_t);
+     if(s<cnt && syscallwrap[s].nats) {
+@@ -967,6 +1085,9 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
+         case 317:   // sys_seccomp
+             R_RAX = 0;  // ignoring call
+             break;
++        case 323:   // sys_userfaultfd
++            R_RAX = -ENOSYS;
++            break;
+         case 334: // It is helpeful to run static binary
+             R_RAX = -ENOSYS;
+             break;
+@@ -1031,6 +1152,18 @@ long EXPORT my_syscall(x64emu_t *emu)
+         }
+         return 0;
+     }
++    if(hmos_inprocess_is_active() && (s == 60 || s == 231)) {
++        emu->quit = 1;
++        emu->exit = 1;
++        OH_LOG_WARN(LOG_APP, "HMOS in-process blocked guest exit syscall %{public}u code=%{public}lld",
++            s, (long long)R_RSI);
++        return R_RSI;
++    }
++    if(hmos_should_block_signal_syscall(s, R_RSI, R_RDX, R_RCX)) {
++        emu->quit = 1;
++        OH_LOG_WARN(LOG_APP, "HMOS in-process blocked guest fatal signal syscall %{public}u", s);
++        return 0;
++    }
+     // check wrapper first
+     uint32_t cnt = sizeof(syscallwrap) / sizeof(scwrap_t);
+     if(s<cnt && syscallwrap[s].nats) {
+@@ -1331,6 +1464,9 @@ long EXPORT my_syscall(x64emu_t *emu)
+             errno = ENOSYS;
+             return -1;
+             #endif
++        case 323: // sys_userfaultfd
++            errno = ENOSYS;
++            return -1;
+         default:
+             if(!(warned&(1<<s))) {
+                 printf_log(LOG_INFO, "Warning: Unsupported libc Syscall 0x%02X (%d)\n", s, s);
+diff --git a/src/emu/x86syscall_32.c b/src/emu/x86syscall_32.c
+index dc2399c..c2fc0db 100644
+--- a/src/emu/x86syscall_32.c
++++ b/src/emu/x86syscall_32.c
+@@ -23,6 +23,7 @@
+ #include <sys/resource.h>
+ #include <poll.h>
+ #include <linux/futex.h>
++#include <pthread.h>
+ 
+ #include "os.h"
+ #include "debug.h"
+@@ -38,6 +39,19 @@
+ #include "x64tls.h"
+ #include "box32.h"
+ #include "converter32.h"
++
++extern int box64_hmos_inprocess_mode __attribute__((weak));
++static int hmos_inprocess_is_active(void)
++{
++    return &box64_hmos_inprocess_mode && box64_hmos_inprocess_mode;
++}
++
++static void hmos_safe_thread_exit(int ret)
++{
++    if(hmos_inprocess_is_active())
++        pthread_exit((void*)(intptr_t)ret);
++    _exit(ret);
++}
+ #include "custommem.h"
+ #include "syscall_user_dispatch.h"
+ 
+@@ -302,7 +316,7 @@ static int clone32_fn(void* arg)
+         my_context->stack_clone_used = 0;
+     if(!args->stack_from_context)
+         munmap(args, args->size);   // this would free the stack, so is it ok to let the system free it instead?
+-    _exit(ret);
++    hmos_safe_thread_exit(ret);
+ }
+ 
+ 
+diff --git a/src/include/os.h b/src/include/os.h
+index 30ac5de..94d48d3 100644
+--- a/src/include/os.h
++++ b/src/include/os.h
+@@ -92,7 +92,10 @@ const char* GetBridgeName(void* p);
+ #define PROT_WRITE 0x2
+ #define PROT_EXEC  0x4
+ 
+-#if defined(__clang__) && !defined(_WIN32)
++#if defined(BOX64_HMOS)
++#define isnanf(x) __builtin_isnan((float)(x))
++#define isinff(x) __builtin_isinf((float)(x))
++#elif defined(__clang__) && !defined(_WIN32)
+ extern int isinff(float);
+ extern int isnanf(float);
+ #elif defined(_WIN32)
+diff --git a/src/include/signals.h b/src/include/signals.h
+index 930cc35..fa8cb08 100644
+--- a/src/include/signals.h
++++ b/src/include/signals.h
+@@ -7,7 +7,7 @@
+ 
+ typedef void (*sighandler_t)(int);
+ 
+-#ifdef ANDROID
++#if defined(ANDROID) && !defined(BOX64_HMOS)
+ typedef struct x64_sigaction_s {
+ 	int sa_flags;
+ 	union {
+diff --git a/src/librarian/librarian.c b/src/librarian/librarian.c
+index fe9660d..7feda2f 100644
+--- a/src/librarian/librarian.c
++++ b/src/librarian/librarian.c
+@@ -1,5 +1,6 @@
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <string.h>
+ 
+ #include <pthread.h>
+ #include <assert.h>
+@@ -20,6 +21,24 @@
+ 
+ KHASH_MAP_IMPL_INT(mapoffsets, cstr_t);
+ 
++#ifdef BOX64_HMOS_INPROCESS
++static int hmos_path_has_suffix(const char* path, const char* suffix)
++{
++    if(!path || !suffix)
++        return 0;
++    size_t path_len = strlen(path);
++    size_t suffix_len = strlen(suffix);
++    return path_len >= suffix_len && !strcmp(path + path_len - suffix_len, suffix);
++}
++
++static int hmos_is_wine_unix_sidecar(const char* path)
++{
++    if(!path)
++        return 0;
++    return strstr(path, "/lib/wine/x86_64-unix/") && hmos_path_has_suffix(path, ".so");
++}
++#endif
++
+ lib_t *NewLibrarian(box64context_t* context)
+ {
+     lib_t *maplib = (lib_t*)box_calloc(1, sizeof(lib_t));
+@@ -226,6 +245,13 @@ static int AddNeededLib_add(lib_t** maplib, int local, needed_libs_t* needed, in
+     needed->libs[n] = lib = NewLibrary(path, box64, verneeded, needed->rpath);
+     if(!lib) {
+         printf_dump(LOG_DEBUG, "Faillure to create lib => fail\n");
++        #ifdef BOX64_HMOS_INPROCESS
++        if(hmos_is_wine_unix_sidecar(path)) {
++            printf_log(LOG_NONE, "HMOS AddNeededLib: soft-missing Wine PE-only sidecar path=%s\n", path);
++            return 0;
++        }
++        printf_log(LOG_NONE, "HMOS AddNeededLib: create failed path=%s\n", path);
++        #endif
+         return 1;   //Error
+     }
+ 
+@@ -252,6 +278,10 @@ static int AddNeededLib_add(lib_t** maplib, int local, needed_libs_t* needed, in
+ 
+     if(AddSymbolsLibrary(*maplib, lib, emu)) {   // also add needed libs
+         printf_dump(LOG_DEBUG, "Failure to Add lib => fail\n");
++        #ifdef BOX64_HMOS_INPROCESS
++        printf_log(LOG_NONE, "HMOS AddNeededLib: add symbols failed path=%s lib=%s\n",
++            path, GetNameLib(lib) ? GetNameLib(lib) : "<null>");
++        #endif
+         return 1;
+     }
+ 
+@@ -303,12 +333,20 @@ int AddNeededLib_init(lib_t* maplib, int local, int bindnow, int deepbind, libra
+         // load dependancies and launch init sequence
+         if(LoadNeededLibs(mainelf, maplib, local, bindnow, deepbind, box64, emu)) {
+             printf_dump(LOG_DEBUG, "Failure to Add dependant lib => fail\n");
++            #ifdef BOX64_HMOS_INPROCESS
++            printf_log(LOG_NONE, "HMOS AddNeededLib: load deps failed lib=%s\n",
++                GetNameLib(lib) ? GetNameLib(lib) : "<null>");
++            #endif
+             return 1;
+         }
+ 
+         // finalize the lib
+         if(FinalizeLibrary(lib, local?maplib:NULL, bindnow, deepbind, emu)) {
+             printf_dump(LOG_DEBUG, "Failure to finalizing lib => fail\n");
++            #ifdef BOX64_HMOS_INPROCESS
++            printf_log(LOG_NONE, "HMOS AddNeededLib: finalize failed lib=%s\n",
++                GetNameLib(lib) ? GetNameLib(lib) : "<null>");
++            #endif
+             return 1;
+         }
+     }
+@@ -339,6 +377,9 @@ int AddNeededLib(lib_t* maplib, int local, int bindnow, int deepbind, needed_lib
+     for(int i=0; i<needed->size; ++i) {
+         if(AddNeededLib_add(&maplib, local, needed, i, verneeded, box64, emu)) {
+             printf_log(strchr(needed->names[i],'/')?LOG_DEBUG:LOG_INFO, "Error loading needed lib %s\n", needed->names[i]);
++            #ifdef BOX64_HMOS_INPROCESS
++            printf_log(LOG_NONE, "HMOS AddNeededLib: loading needed failed name=%s\n", needed->names[i]);
++            #endif
+             ret = 1;
+         }
+     }
+@@ -352,6 +393,9 @@ int AddNeededLib(lib_t* maplib, int local, int bindnow, int deepbind, needed_lib
+     for (int i=0; i<n; ++i)
+         if(AddNeededLib_init(maplib, local, bindnow, deepbind, needed->libs[n-i-1], verneeded, box64, emu)) {
+             printf_log(LOG_INFO, "Error initializing needed lib %s\n", needed->names[i]);
++            #ifdef BOX64_HMOS_INPROCESS
++            printf_log(LOG_NONE, "HMOS AddNeededLib: initializing needed failed name=%s\n", needed->names[i]);
++            #endif
+             ret = 1;
+         }
+     // all done
+diff --git a/src/librarian/library.c b/src/librarian/library.c
+index edc6dd7..7239099 100644
+--- a/src/librarian/library.c
++++ b/src/librarian/library.c
+@@ -29,6 +29,18 @@
+ #include "library_inner.h"
+ 
+ #include "wrappedlibs.h"
++#ifdef BOX64_HMOS
++void pFEpi(x64emu_t *emu, uintptr_t fnc);
++void pFEpp(x64emu_t *emu, uintptr_t fnc);
++void pFEv(x64emu_t *emu, uintptr_t fnc);
++void iFEpp(x64emu_t *emu, uintptr_t fnc);
++void iFEp(x64emu_t *emu, uintptr_t fnc);
++void* my_dlopen(x64emu_t* emu, void *filename, int flag);
++int my_dlclose(x64emu_t* emu, void *handle);
++char* my_dlerror(x64emu_t* emu);
++void* my_dlsym(x64emu_t* emu, void *handle, void *symbol);
++int my_dladdr(x64emu_t* emu, void *addr, void *info);
++#endif
+ // create the native lib list
+ #define GO(P, N) int wrapped##N##_init(library_t* lib, box64context_t *box64); \
+                  void wrapped##N##_fini(library_t* lib);
+@@ -1107,6 +1119,55 @@ static int getSymbolInSymbolMaps(library_t*lib, const char* name, int noweak, ui
+     return 0;
+ }
+ 
++#ifdef BOX64_HMOS
++static int hmosIsVersionedAlias(const char* name, const char* base)
++{
++    size_t len = strlen(base);
++    return !strncmp(name, base, len) && (name[len] == '\0' || name[len] == '@');
++}
++
++static int hmosGetLibcDlAlias(library_t *lib, const char* name, uintptr_t *addr, uintptr_t *size, int* weak)
++{
++    wrapper_t wrapper = NULL;
++    void* symbol = NULL;
++    const char* bridge_name = NULL;
++
++    if(!lib || !lib->name || strcmp(lib->name, "libc.so.6"))
++        return 0;
++
++    if(hmosIsVersionedAlias(name, "dlopen")) {
++        wrapper = pFEpi;
++        symbol = my_dlopen;
++        bridge_name = "dlopen";
++    } else if(hmosIsVersionedAlias(name, "dlsym")) {
++        wrapper = pFEpp;
++        symbol = my_dlsym;
++        bridge_name = "dlsym";
++    } else if(hmosIsVersionedAlias(name, "dlerror")) {
++        wrapper = pFEv;
++        symbol = my_dlerror;
++        bridge_name = "dlerror";
++    } else if(hmosIsVersionedAlias(name, "dladdr")) {
++        wrapper = iFEpp;
++        symbol = my_dladdr;
++        bridge_name = "dladdr";
++    } else if(hmosIsVersionedAlias(name, "dlclose")) {
++        wrapper = iFEp;
++        symbol = my_dlclose;
++        bridge_name = "dlclose";
++    } else {
++        return 0;
++    }
++
++    *addr = AddCheckBridge(lib->w.bridge, wrapper, symbol, 0, bridge_name);
++    *size = sizeof(void*);
++    *weak = 0;
++    printf_log(LOG_NONE, "HMOS libc dl alias bridge %s via %s -> %p\n",
++        name, bridge_name, (void*)*addr);
++    return 1;
++}
++#endif
++
+ int getSymbolInMaps(library_t *lib, const char* name, int noweak, uintptr_t *addr, uintptr_t *size, int* weak, int version, const char* vername, int local, int veropt)
+ {
+     if(version==-2) // don't send global native symbol for a version==-2 search
+@@ -1121,6 +1182,11 @@ int getSymbolInMaps(library_t *lib, const char* name, int noweak, uintptr_t *add
+     if(getSymbolInSymbolMaps(lib, name, noweak, addr, size, weak))
+         return 1;
+ 
++#ifdef BOX64_HMOS
++    if(hmosGetLibcDlAlias(lib, name, addr, size, weak))
++        return 1;
++#endif
++
+     return 0;
+ }
+ 
+diff --git a/src/libtools/auxval.c b/src/libtools/auxval.c
+index 1e4b604..9612393 100644
+--- a/src/libtools/auxval.c
++++ b/src/libtools/auxval.c
+@@ -12,6 +12,10 @@
+ #include <stddef.h>
+ #include <stdarg.h>
+ #include <fts.h>
++#ifdef BOX64_HMOS_INPROCESS
++#include <sys/auxv.h>
++#include <elf.h>
++#endif
+ 
+ #include "box64context.h"
+ #include "debug.h"
+@@ -21,15 +25,24 @@
+ #include "auxval.h"
+ 
+ static uintptr_t* auxval_start = NULL;
++#ifdef BOX64_HMOS_INPROCESS
++static uintptr_t hmos_empty_auxval[] = { AT_NULL, 0 };
++#endif
+ 
+ int init_auxval(int argc, const char **argv, char **env) {
+     (void)argc; (void)argv;
+ 
++#ifdef BOX64_HMOS_INPROCESS
++    (void)env;
++    auxval_start = hmos_empty_auxval;
++    return 0;
++#else
+     // auxval vector is after envs...
+     while(*env)
+         env++;
+     auxval_start = (uintptr_t*)(env+1);
+     return 0;
++#endif
+ }
+ 
+ #ifdef BUILD_LIB
+@@ -38,6 +51,9 @@ __attribute__((section(".init_array"))) static void *init_auxval_constructor = &
+ 
+ unsigned long real_getauxval(unsigned long type)
+ {
++#ifdef BOX64_HMOS_INPROCESS
++    return getauxval(type);
++#else
+     if(!auxval_start)
+         return 0;
+     uintptr_t* p = auxval_start;
+@@ -47,6 +63,7 @@ unsigned long real_getauxval(unsigned long type)
+         p+=2;
+     }
+     return 0;
++#endif
+ }
+ 
+ #ifdef BOX32
+diff --git a/src/libtools/signal_private.h b/src/libtools/signal_private.h
+index 8923119..e11d95e 100644
+--- a/src/libtools/signal_private.h
++++ b/src/libtools/signal_private.h
+@@ -185,7 +185,7 @@ typedef struct x64_mcontext_s
+ } x64_mcontext_t;
+ 
+ // /!\ signal sig_set is different than glibc __sig_set
+-#ifndef ANDROID
++#ifndef _NSIG_WORDS
+ #define _NSIG_WORDS (1024 / (sizeof(unsigned long int)*8))
+ #endif
+ 
+diff --git a/src/libtools/signals.c b/src/libtools/signals.c
+index ecb074e..567bd95 100644
+--- a/src/libtools/signals.c
++++ b/src/libtools/signals.c
+@@ -15,6 +15,11 @@
+ #ifndef ANDROID
+ #include <execinfo.h>
+ #endif
++#ifdef BOX64_HMOS
++#define LOG_DOMAIN 0x2330
++#define LOG_TAG "Box64Core"
++#include "hilog/log.h"
++#endif
+ 
+ #include "x64_signals.h"
+ #include "os.h"
+@@ -47,6 +52,19 @@
+ 
+ #include "signal_private.h"
+ 
++#ifdef BOX64_HMOS
++extern int box64_hmos_inprocess_mode __attribute__((weak));
++static int hmos_signal_log_active(void)
++{
++    return &box64_hmos_inprocess_mode && box64_hmos_inprocess_mode;
++}
++
++static int hmos_signal_log_interesting(int signum)
++{
++    return signum==X64_SIGSYS || signum==X64_SIGSEGV || signum==X64_SIGILL || signum==X64_SIGBUS;
++}
++#endif
++
+ static void sigstack_destroy(void* p)
+ {
+     x64_stack_t *ss = (x64_stack_t*)p;
+@@ -1396,6 +1414,14 @@ EXPORT sighandler_t my_sysv_signal(x64emu_t* emu, int signum, sighandler_t handl
+ int EXPORT my_sigaction(x64emu_t* emu, int signum, const x64_sigaction_t *act, x64_sigaction_t *oldact)
+ {
+     printf_log(LOG_DEBUG, "Sigaction(signum=%d, act=%p(f=%p, flags=0x%x), old=%p)\n", signum, act, act?act->_u._sa_handler:NULL, act?act->sa_flags:0, oldact);
++#ifdef BOX64_HMOS
++    if(hmos_signal_log_interesting(signum)) {
++        OH_LOG_WARN(LOG_APP, "HMOS sigaction enter active=%{public}d signum=%{public}d act=%{public}p handler=0x%{public}lx flags=0x%{public}x old=%{public}p stored=0x%{public}lx",
++            hmos_signal_log_active(),
++            signum, act, act ? (unsigned long)(uintptr_t)act->_u._sa_handler : 0UL,
++            act ? act->sa_flags : 0, oldact, (unsigned long)my_context->signals[signum]);
++    }
++#endif
+     if(signum<0 || signum>MAX_SIGNAL) {
+         errno = EINVAL;
+         return -1;
+@@ -1434,6 +1460,14 @@ int EXPORT my_sigaction(x64emu_t* emu, int signum, const x64_sigaction_t *act, x
+     int ret = 0;
+     if(signum!=X64_SIGSEGV && signum!=X64_SIGBUS && signum!=X64_SIGILL && signum!=X64_SIGABRT)
+         ret = sigaction(signal_from_x64(signum), act?&newact:NULL, oldact?&old:NULL);
++#ifdef BOX64_HMOS
++    if(hmos_signal_log_interesting(signum)) {
++        OH_LOG_WARN(LOG_APP, "HMOS sigaction leave active=%{public}d signum=%{public}d host=%{public}d ret=%{public}d errno=%{public}d stored=0x%{public}lx is_sigaction=%{public}d",
++            hmos_signal_log_active(),
++            signum, signal_from_x64(signum), ret, errno,
++            (unsigned long)my_context->signals[signum], my_context->is_sigaction[signum]);
++    }
++#endif
+     if(oldact) {
+         oldact->sa_flags = old.sa_flags;
+         oldact->sa_mask = old.sa_mask;
+@@ -1453,6 +1487,15 @@ __attribute__((alias("my_sigaction")));
+ int EXPORT my_syscall_rt_sigaction(x64emu_t* emu, int signum, const x64_sigaction_restorer_t *act, x64_sigaction_restorer_t *oldact, int sigsetsize)
+ {
+     printf_log(LOG_DEBUG, "Syscall/Sigaction(signum=%d, act=%p, old=%p, size=%d)\n", signum, act, oldact, sigsetsize);
++#ifdef BOX64_HMOS
++    if(hmos_signal_log_interesting(signum)) {
++        OH_LOG_WARN(LOG_APP, "HMOS rt_sigaction enter active=%{public}d signum=%{public}d act=%{public}p handler=0x%{public}lx flags=0x%{public}x old=%{public}p size=%{public}d stored=0x%{public}lx",
++            hmos_signal_log_active(),
++            signum, act, act ? (unsigned long)(uintptr_t)act->_u._sa_handler : 0UL,
++            act ? act->sa_flags : 0, oldact, sigsetsize,
++            (unsigned long)my_context->signals[signum]);
++    }
++#endif
+     if(signum<0 || signum>MAX_SIGNAL) {
+         errno = EINVAL;
+         return -1;
+@@ -1496,6 +1539,14 @@ int EXPORT my_syscall_rt_sigaction(x64emu_t* emu, int signum, const x64_sigactio
+         }
+ 
+         int ret = syscall(__NR_rt_sigaction, signum, act?&newact:NULL, oldact?&old:NULL, (sigsetsize>16)?16:sigsetsize);
++#ifdef BOX64_HMOS
++        if(hmos_signal_log_interesting(signum)) {
++            OH_LOG_WARN(LOG_APP, "HMOS rt_sigaction kernel leave active=%{public}d signum=%{public}d ret=%{public}d errno=%{public}d stored=0x%{public}lx is_sigaction=%{public}d",
++                hmos_signal_log_active(),
++                signum, ret, errno,
++                (unsigned long)my_context->signals[signum], my_context->is_sigaction[signum]);
++        }
++#endif
+         if(oldact && ret==0) {
+             oldact->sa_flags = old.sa_flags;
+             memcpy(&oldact->sa_mask, &old.sa_mask, (sigsetsize>16)?16:sigsetsize);
+@@ -1541,6 +1592,14 @@ int EXPORT my_syscall_rt_sigaction(x64emu_t* emu, int signum, const x64_sigactio
+ 
+         if(signum!=X64_SIGSEGV && signum!=X64_SIGBUS && signum!=X64_SIGILL && signum!=X64_SIGABRT)
+             ret = sigaction(signal_from_x64(signum), act?&newact:NULL, oldact?&old:NULL);
++#ifdef BOX64_HMOS
++        if(hmos_signal_log_interesting(signum)) {
++            OH_LOG_WARN(LOG_APP, "HMOS rt_sigaction libc leave active=%{public}d signum=%{public}d host=%{public}d ret=%{public}d errno=%{public}d stored=0x%{public}lx is_sigaction=%{public}d",
++                hmos_signal_log_active(),
++                signum, signal_from_x64(signum), ret, errno,
++                (unsigned long)my_context->signals[signum], my_context->is_sigaction[signum]);
++        }
++#endif
+         if(oldact && ret==0) {
+             oldact->sa_flags = old.sa_flags;
+             memcpy(&oldact->sa_mask, &old.sa_mask, (sigsetsize>8)?8:sigsetsize);
+diff --git a/src/libtools/syscall_user_dispatch.c b/src/libtools/syscall_user_dispatch.c
+index 08ae9f5..274964a 100644
+--- a/src/libtools/syscall_user_dispatch.c
++++ b/src/libtools/syscall_user_dispatch.c
+@@ -13,6 +13,11 @@
+ #include "os.h"
+ #include "x64emu.h"
+ #include "emu/x64emu_private.h"
++#ifdef BOX64_HMOS
++#define LOG_DOMAIN 0x2330
++#define LOG_TAG "Box64Core"
++#include "hilog/log.h"
++#endif
+ #include "debug.h"
+ #include "custommem.h"
+ #include "signals.h"
+@@ -104,6 +109,10 @@ long my_syscall_user_dispatch_prctl(x64emu_t* emu, unsigned long op, unsigned lo
+     emu->sud_offset = offset;
+     emu->sud_len = len;
+     emu->sud_enabled = 1;
++#ifdef BOX64_HMOS
++    OH_LOG_INFO(LOG_APP, "HMOS SUD enabled op=%{public}lu offset=0x%{public}lx len=0x%{public}lx selector=0x%{public}lx",
++                op, offset, len, (unsigned long)selector);
++#endif
+     printf_log(LOG_DEBUG, "Enabled syscall user dispatch: allowed=%p-%p selector=%p\n",
+                (void*)offset, (void*)(offset + len), selector);
+     return 0;
+@@ -137,6 +146,11 @@ int my_syscall_user_dispatch(x64emu_t* emu, uintptr_t call_addr, long syscall_nr
+ 
+     printf_log(LOG_DEBUG, "%04d|Syscall user dispatch: syscall=%ld call_addr=%p arch=%s\n",
+                GetTID(), syscall_nr, (void*)call_addr, is32bits ? "i386" : "x86_64");
++#ifdef BOX64_HMOS
++    OH_LOG_WARN(LOG_APP, "HMOS SUD dispatch syscall=%{public}ld call_addr=0x%{public}lx arch=%{public}s selector=0x%{public}lx state=%{public}u",
++                syscall_nr, (unsigned long)call_addr, is32bits ? "i386" : "x86_64",
++                (unsigned long)emu->sud_selector, emu->sud_selector ? state : 255);
++#endif
+     sud_emit_sigsys(emu, call_addr, syscall_nr, is32bits);
+     return 1;
+ }
+diff --git a/src/libtools/threads.c b/src/libtools/threads.c
+index 2737c9b..711c0c9 100644
+--- a/src/libtools/threads.c
++++ b/src/libtools/threads.c
+@@ -41,14 +41,20 @@ static _Atomic int g_active_emu_workers = 0;
+ typedef void (*vFppp_t)(void*, void*, void*);
+ typedef void (*vFpi_t)(void*, int);
+ typedef int (*iFppip_t)(void*, void*, int, void*);
++#ifdef BOX64_HMOS
++typedef int (*iFli_t)(pthread_t, int);
++#else
+ typedef int (*iFli_t)(long unsigned int, int);
++#endif
+ typedef struct emuthread_s emuthread_t;
+ 
+ static vFppp_t real_pthread_cleanup_push_defer = NULL;
+ static vFpi_t real_pthread_cleanup_pop_restore = NULL;
+ static iFppip_t real_pthread_cond_clockwait = NULL;
++#ifndef ANDROID
+ void _pthread_cleanup_push(void* buffer, void* routine, void* arg);	// declare hidden functions
+ void _pthread_cleanup_pop(void* buffer, int exec);
++#endif
+ // with glibc 2.34+, pthread_kill changed behaviour and might break some program, so using old version if possible
+ // it will be pthread_kill@GLIBC_2.17 on aarch64, but it's GLIBC_2.2.5 on x86_64
+ static iFli_t real_phtread_kill_old = NULL;
+diff --git a/src/tools/bridge.c b/src/tools/bridge.c
+index bb94cc0..c757864 100644
+--- a/src/tools/bridge.c
++++ b/src/tools/bridge.c
+@@ -53,11 +53,17 @@ brick_t* NewBrick(void* old, int is32bits)
+         if(old)
+             old = old + NBRICK * sizeof(onebridge_t);
+     }
+-    void* ptr = box_mmap(old, NBRICK * sizeof(onebridge_t), PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | ((!is32bits && box64_wine)?0:0x40) | MAP_ANONYMOUS, -1, 0); // 0x40 is MAP_32BIT
++    int host_prot = PROT_READ | PROT_WRITE | PROT_EXEC;
++#ifdef BOX64_HMOS_INPROCESS
++    host_prot = PROT_READ | PROT_WRITE;
++#endif
++    void* ptr = box_mmap(old, NBRICK * sizeof(onebridge_t), host_prot, MAP_PRIVATE | ((!is32bits && box64_wine)?0:0x40) | MAP_ANONYMOUS, -1, 0); // 0x40 is MAP_32BIT
+     if(ptr == MAP_FAILED)
+-        ptr = box_mmap(NULL, NBRICK * sizeof(onebridge_t), PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | ((!is32bits && box64_wine)?0:0x40) | MAP_ANONYMOUS, -1, 0);
++        ptr = box_mmap(NULL, NBRICK * sizeof(onebridge_t), host_prot, MAP_PRIVATE | ((!is32bits && box64_wine)?0:0x40) | MAP_ANONYMOUS, -1, 0);
+     if(ptr == MAP_FAILED) {
+         printf_log(LOG_NONE, "Warning, cannot allocate 0x%lx aligned bytes for bridge, will probably crash later\n", NBRICK*sizeof(onebridge_t));
++        ret->b = NULL;
++        return ret;
+     }
+     setProtection_box((uintptr_t)ptr, NBRICK * sizeof(onebridge_t), PROT_READ | PROT_WRITE | PROT_EXEC | PROT_NOPROT);
+     dynarec_log(LOG_INFO, "New Bridge brick at %p (size 0x%zx)\n", ptr, NBRICK*sizeof(onebridge_t));
+@@ -109,10 +115,20 @@ uintptr_t AddBridge2(bridge_t* bridge, wrapper_t w, void* fnc, void* fnc2, int N
+ 
+     mutex_lock(&my_context->mutex_bridge);
+     b = bridge->last;
++    if(!b || !b->b) {
++        mutex_unlock(&my_context->mutex_bridge);
++        printf_log(LOG_NONE, "Warning, bridge allocation unavailable for AddBridge2\n");
++        return 0;
++    }
+     if(b->sz == (int)NBRICK) {
+         b->next = NewBrick(b->b, box64_is32bits);
+         b = b->next;
+         bridge->last = b;
++        if(!b || !b->b) {
++            mutex_unlock(&my_context->mutex_bridge);
++            printf_log(LOG_NONE, "Warning, bridge allocation unavailable for AddBridge2\n");
++            return 0;
++        }
+     }
+     sz = b->sz;
+     b->sz++;
+@@ -214,10 +230,20 @@ uintptr_t AddAltJump(bridge_t* bridge, uintptr_t addr, uintptr_t jump_to_addr)
+ 
+     mutex_lock(&my_context->mutex_bridge);
+     b = bridge->last;
++    if(!b || !b->b) {
++        mutex_unlock(&my_context->mutex_bridge);
++        printf_log(LOG_NONE, "Warning, bridge allocation unavailable for AddAltJump\n");
++        return 0;
++    }
+     if(b->sz == (int)NBRICK) {
+         b->next = NewBrick(b->b, 1);
+         b = b->next;
+         bridge->last = b;
++        if(!b || !b->b) {
++            mutex_unlock(&my_context->mutex_bridge);
++            printf_log(LOG_NONE, "Warning, bridge allocation unavailable for AddAltJump\n");
++            return 0;
++        }
+     }
+     sz = b->sz++;
+     mutex_unlock(&my_context->mutex_bridge);
+@@ -284,10 +310,20 @@ uintptr_t AddVSyscall(bridge_t* bridge, int num)
+     int sz = -1;
+     mutex_lock(&my_context->mutex_bridge);
+     b = bridge->last;
++    if(!b || !b->b) {
++        mutex_unlock(&my_context->mutex_bridge);
++        printf_log(LOG_NONE, "Warning, bridge allocation unavailable for AddVSyscall\n");
++        return 0;
++    }
+     if(b->sz == (int)NBRICK) {
+         b->next = NewBrick(b->b, box64_is32bits);
+         b = b->next;
+         bridge->last = b;
++        if(!b || !b->b) {
++            mutex_unlock(&my_context->mutex_bridge);
++            printf_log(LOG_NONE, "Warning, bridge allocation unavailable for AddVSyscall\n");
++            return 0;
++        }
+     }
+     sz = b->sz;
+     b->sz++;
+diff --git a/src/tools/env.c b/src/tools/env.c
+index c11cf67..cf32da3 100644
+--- a/src/tools/env.c
++++ b/src/tools/env.c
+@@ -368,7 +368,7 @@ static void pushNewEntry(const char* name, box64env_t* env, int wildcard)
+ 
+ static void internalApplyEnvFileEntry(const char* entryname, const box64env_t* env);
+ 
+-#ifdef ANDROID
++#if defined(ANDROID) && !defined(BOX64_HMOS)
+ static int shm_open(const char *name, int oflag, mode_t mode) {
+     return -1;
+ }
+diff --git a/src/tools/wine_tools.c b/src/tools/wine_tools.c
+index 1d89f2a..a90f692 100644
+--- a/src/tools/wine_tools.c
++++ b/src/tools/wine_tools.c
+@@ -24,7 +24,15 @@ typedef struct wine_prereserve_32_s
+ #include "box32.h"
+ #endif
+ // only the prereseve argument is reserved, not the other zone that wine-preloader reserve
+-static wine_prereserve_t my_wine_reserve[] = {{(void*)0x00010000, 0x00008000}, {(void*)0x00110000, 0x30000000}, {(void*)0x7f000000, 0x03000000}, {0, 0}, {0, 0}};
++// Leave Wine's shared user data page free so ntdll can map it explicitly.
++static wine_prereserve_t my_wine_reserve[] = {
++    {(void*)0x00010000, 0x00008000},
++    {(void*)0x00110000, 0x30000000},
++    {(void*)0x7f000000, 0x00de0000},
++    {(void*)0x7ffe1000, 0x0201f000},
++    {0, 0},
++    {0, 0}
++};
+ 
+ int wine_preloaded = 0;
+ 
+diff --git a/src/wrapped/wrappedlibc.c b/src/wrapped/wrappedlibc.c
+index f6ba8e9..b4330f4 100644
+--- a/src/wrapped/wrappedlibc.c
++++ b/src/wrapped/wrappedlibc.c
+@@ -23,6 +23,7 @@ extern int _nl_msg_cat_cntr __attribute__((weak));
+ #include <stdio.h>
+ #include <stddef.h>
+ #include <string.h>
++#include <strings.h>
+ #include <wchar.h>
+ #include <dlfcn.h>
+ #include <signal.h>
+@@ -37,6 +38,11 @@ extern int _nl_msg_cat_cntr __attribute__((weak));
+ #include <glob.h>
+ #include <ctype.h>
+ #include <dirent.h>
++#ifdef BOX64_HMOS
++#define LOG_DOMAIN 0x2330
++#define LOG_TAG "Box64Core"
++#include "hilog/log.h"
++#endif
+ #include <search.h>
+ #include <sys/types.h>
+ #include <poll.h>
+@@ -60,6 +66,7 @@ extern int _nl_msg_cat_cntr __attribute__((weak));
+ #include <sys/resource.h>
+ #include <sys/prctl.h>
+ #include <sys/ptrace.h>
++#include <sys/wait.h>
+ #include <error.h>
+ #undef LOG_INFO
+ #undef LOG_DEBUG
+@@ -98,6 +105,16 @@ extern int _nl_msg_cat_cntr __attribute__((weak));
+ #define LOG_DEBUG 2
+ #endif
+ 
++#ifdef BOX64_HMOS_INPROCESS
++static int hmos_guest_host_prot(int prot)
++{
++    int host_prot = prot & ~PROT_EXEC;
++    if ((prot & PROT_EXEC) && !(host_prot & PROT_READ))
++        host_prot |= PROT_READ;
++    return host_prot;
++}
++#endif
++
+ 
+ #define LIBNAME libc
+ const char* libcName = "libc.so.6";
+@@ -132,6 +149,19 @@ typedef void* (*pFpip_t)(void*, int, void*);
+ 
+ #define ADDED_FUNCTIONS() \
+ 
++#ifdef BOX64_HMOS
++#undef fstat64
++#undef lstat64
++#undef stat64
++#undef fopen64
++#undef ftw64
++#undef open64
++#undef fstatat64
++#undef nftw64
++#undef scandir64
++#undef mmap64
++#endif
++
+ #include "generated/wrappedlibctypes.h"
+ 
+ EXPORT uintptr_t my_error_print_progname = 0;
+@@ -157,6 +187,527 @@ static void my_wrap_error_print_progname(void)
+ 
+ #include "wrappercallback.h"
+ 
++#ifdef BOX64_HMOS
++extern int box64_hmos_inprocess_mode __attribute__((weak));
++extern int box64_hmos_main(int argc, const char **argv, char **env) __attribute__((weak));
++extern int box64_hmos_call_symbol(int argc, const char **argv, char **env, const char *symbol) __attribute__((weak));
++static int hmos_inprocess_is_active(void)
++{
++    return &box64_hmos_inprocess_mode && box64_hmos_inprocess_mode;
++}
++
++static int hmos_inprocess_strict_process_model(void)
++{
++    const char* strict = getenv("WINE_HMOS_INPROCESS_STRICT");
++    if (!strict || !strict[0])
++        return 1;
++    return strcmp(strict, "0") && strcasecmp(strict, "false") && strcasecmp(strict, "no");
++}
++
++static uintptr_t hmos_inprocess_guest_return(uintptr_t guest_rsp)
++{
++    if (!guest_rsp || !(getProtection(guest_rsp) & PROT_READ))
++        return 0;
++    return *(uintptr_t*)guest_rsp;
++}
++
++static unsigned long hmos_process_broker_seq = 0;
++
++static void hmos_inprocess_write_argv_fields(FILE* request, char* const argv[])
++{
++    int argc = 0;
++    if (!request || !argv)
++        return;
++    while (argv[argc])
++        ++argc;
++    fprintf(request, "argc=%d\n", argc);
++    for (int i = 0; i < argc && i < 64; ++i)
++        fprintf(request, "argv.%d=%s\n", i, argv[i] ? argv[i] : "");
++}
++
++static void hmos_inprocess_write_command_field(FILE* request, char* const argv[])
++{
++    size_t used = 0;
++    char command[4096];
++    if (!request || !argv || !argv[0])
++        return;
++    command[0] = '\0';
++    for (int i = 0; argv[i] && i < 64; ++i) {
++        const char* arg = argv[i];
++        int needs_quote = 0;
++        for (const char* p = arg; *p; ++p) {
++            if (*p == ' ' || *p == '\t' || *p == '"') {
++                needs_quote = 1;
++                break;
++            }
++        }
++        if (used + strlen(arg) + 4 >= sizeof(command))
++            break;
++        if (i)
++            command[used++] = ' ';
++        if (needs_quote)
++            command[used++] = '"';
++        for (const char* p = arg; *p && used + 2 < sizeof(command); ++p) {
++            if (*p == '"')
++                command[used++] = '\\';
++            command[used++] = *p;
++        }
++        if (needs_quote)
++            command[used++] = '"';
++        command[used] = '\0';
++    }
++    fprintf(request, "cmd=%s\n", command);
++}
++
++static void hmos_inprocess_write_exec_env_field(FILE* request, const char* name)
++{
++    const char* value;
++    if (!request || !name || !name[0])
++        return;
++    value = getenv(name);
++    if (value && value[0])
++        fprintf(request, "exec_env.%s=%s\n", name, value);
++}
++
++static int hmos_inprocess_write_process_broker_request(const char* call, const char* path,
++                                                       char* const argv[], uintptr_t caller, uintptr_t guest_rsp)
++{
++    const char* broker_dir = getenv("WINE_HMOS_PROCESS_BROKER_DIR");
++    const char* backend = getenv("WINE_HMOS_EXEC_BACKEND");
++    const char* isolation = getenv("WINE_HMOS_PROCESS_ISOLATION");
++    const char* slot = getenv("WINE_HMOS_PROCESS_SLOT_ID");
++    const char* caller_name = caller ? getAddrFunctionName(caller) : "<unknown>";
++    uintptr_t ret_addr = hmos_inprocess_guest_return(guest_rsp);
++    const char* ret_name = ret_addr ? getAddrFunctionName(ret_addr) : "<unknown>";
++    char request_path[MAX_PATH];
++    char cwd[MAX_PATH];
++    FILE* request;
++    int written;
++
++    if (!broker_dir || !broker_dir[0])
++        return 0;
++
++    written = snprintf(request_path, sizeof(request_path), "%s/box64-request-%ld-%lu.txt",
++                       broker_dir, (long)getpid(), ++hmos_process_broker_seq);
++    if (written <= 0 || (size_t)written >= sizeof(request_path))
++        return 0;
++
++    request = fopen(request_path, "w");
++    if (!request) {
++        OH_LOG_WARN(LOG_APP, "HMOS process broker request write failed dir=%{public}s errno=%{public}d",
++            broker_dir, errno);
++        return 0;
++    }
++
++    fprintf(request, "version=1\n");
++    fprintf(request, "source=box64-libc-wrapper\n");
++    fprintf(request, "backend=%s\n", backend ? backend : "");
++    fprintf(request, "isolation=%s\n", isolation ? isolation : "");
++    fprintf(request, "slot=%s\n", slot ? slot : "");
++    fprintf(request, "pid=%ld\n", (long)getpid());
++    if (getcwd(cwd, sizeof(cwd)))
++        fprintf(request, "cwd=%s\n", cwd);
++    fprintf(request, "call=%s\n", call ? call : "process call");
++    fprintf(request, "path=%s\n", path ? path : "");
++    hmos_inprocess_write_command_field(request, argv);
++    hmos_inprocess_write_argv_fields(request, argv);
++    hmos_inprocess_write_exec_env_field(request, "WINESERVERSOCKET");
++    hmos_inprocess_write_exec_env_field(request, "WINEPRELOADRESERVE");
++    hmos_inprocess_write_exec_env_field(request, "WINELOADERNOEXEC");
++    hmos_inprocess_write_exec_env_field(request, "WINE_LD_PRELOAD");
++    hmos_inprocess_write_exec_env_field(request, "LD_PRELOAD");
++    hmos_inprocess_write_exec_env_field(request, "BOX64_ARG0");
++    fprintf(request, "caller=0x%llx\n", (unsigned long long)caller);
++    fprintf(request, "caller_name=%s\n", caller_name ? caller_name : "");
++    fprintf(request, "return=0x%llx\n", (unsigned long long)ret_addr);
++    fprintf(request, "return_name=%s\n", ret_name ? ret_name : "");
++    fprintf(request, "status=blocked\n");
++    fprintf(request, "reason=box64 in-process process call requires Wine broker\n");
++    fclose(request);
++
++    OH_LOG_WARN(LOG_APP, "HMOS process broker request queued path=%{public}s call=%{public}s target=%{public}s ret=%{public}s",
++        request_path, call ? call : "process call", path ? path : "<none>", ret_name ? ret_name : "<unknown>");
++    return 1;
++}
++
++static int hmos_inprocess_process_call_is_fork(const char* call)
++{
++    return call && (!strcmp(call, "fork") || !strcmp(call, "vfork"));
++}
++
++static int hmos_inprocess_forbid_process_call(const char* call, const char* path, char* const argv[],
++                                              uintptr_t caller, uintptr_t guest_rsp)
++{
++    const char* caller_name;
++    uintptr_t ret_addr;
++    const char* ret_name;
++    if (!hmos_inprocess_is_active())
++        return 0;
++    if (hmos_inprocess_process_call_is_fork(call) && !hmos_inprocess_strict_process_model()) {
++        OH_LOG_INFO(LOG_APP, "HMOS in-process allowing guest %{public}s until exec broker intercept", call);
++        return 0;
++    }
++    caller_name = caller ? getAddrFunctionName(caller) : "<unknown>";
++    ret_addr = hmos_inprocess_guest_return(guest_rsp);
++    ret_name = ret_addr ? getAddrFunctionName(ret_addr) : "<unknown>";
++    hmos_inprocess_write_process_broker_request(call, path, argv, caller, guest_rsp);
++    errno = ENOSYS;
++    printf_log(LOG_NONE, "HMOS in-process mode blocked guest %s on %s at %p/%s ret %p/%s; host process launch is not available\n",
++        call ? call : "process call", path ? path : "<none>", (void*)caller, caller_name, (void*)ret_addr, ret_name);
++    OH_LOG_WARN(LOG_APP, "HMOS in-process blocked guest %{public}s on %{public}s at 0x%{public}llx/%{public}s ret 0x%{public}llx/%{public}s",
++        call ? call : "process call", path ? path : "<none>", (unsigned long long)caller, caller_name,
++        (unsigned long long)ret_addr, ret_name);
++    return 1;
++}
++
++static int hmos_path_is_wineserver(const char* path)
++{
++    const char* leaf;
++    if (!path || !path[0])
++        return 0;
++    leaf = strrchr(path, '/');
++    leaf = leaf ? leaf + 1 : path;
++    return !strcmp(leaf, "wineserver");
++}
++
++static const char* hmos_path_leaf(const char* path)
++{
++    const char* leaf;
++    if (!path || !path[0])
++        return "";
++    leaf = strrchr(path, '/');
++    return leaf ? leaf + 1 : path;
++}
++
++static int hmos_path_is_wine_preloader(const char* path)
++{
++    const char* leaf = hmos_path_leaf(path);
++    return !strcmp(leaf, "wine64-preloader") || !strcmp(leaf, "wine-preloader");
++}
++
++static int hmos_path_is_wine_unix_loader(const char* path)
++{
++    const char* leaf = hmos_path_leaf(path);
++    return !strcmp(leaf, "wine64") || !strcmp(leaf, "wine");
++}
++
++static int hmos_argv_count(char* const argv[])
++{
++    int argc = 0;
++    if (!argv)
++        return 0;
++    while (argv[argc])
++        ++argc;
++    return argc;
++}
++
++static int hmos_path_is_hmos_loader(const char* path)
++{
++    const char* leaf = hmos_path_leaf(path);
++    return !strcmp(leaf, "wine-hmos-loader.so");
++}
++
++static int hmos_inprocess_try_soft_exec_wine_loader(const char* call, const char* path,
++                                                    char* const argv[], char* const envp[])
++{
++    int argc;
++    int rc;
++    int soft_argc;
++    char** soft_env;
++    const char* hmos_loader;
++    const char** soft_argv = NULL;
++    if (!hmos_inprocess_is_active() || hmos_inprocess_strict_process_model())
++        return 0;
++    if (hmos_path_is_wine_preloader(path)) {
++        errno = ENOENT;
++        OH_LOG_INFO(LOG_APP, "HMOS in-process soft-exec skipping %{public}s preloader %{public}s",
++            call ? call : "exec", path ? path : "<none>");
++        return 1;
++    }
++    if (!hmos_path_is_wine_unix_loader(path))
++        return 0;
++    argc = hmos_argv_count(argv);
++    if (argc <= 0)
++        return 0;
++    if (hmos_inprocess_write_process_broker_request(call, path, argv, 0, 0)) {
++        OH_LOG_INFO(LOG_APP, "HMOS in-process soft-exec handed %{public}s to Wine broker path=%{public}s target=%{public}s",
++            call ? call : "exec", path ? path : "<none>", (argc > 1 && argv[1]) ? argv[1] : "<none>");
++        syscall(SYS_exit_group, 0);
++        __builtin_unreachable();
++    }
++    soft_env = envp ? (char**)envp : environ;
++    hmos_loader = getenv("WINELOADER");
++    if (hmos_loader && hmos_loader[0] && hmos_path_is_hmos_loader(hmos_loader) &&
++        &box64_hmos_call_symbol && box64_hmos_call_symbol) {
++        soft_argc = argc + 1;
++        soft_argv = calloc(soft_argc + 1, sizeof(*soft_argv));
++        if (soft_argv) {
++            soft_argv[0] = "box64-hmos-soft-exec";
++            soft_argv[1] = hmos_loader;
++            for (int i = 1; i < argc; ++i)
++                soft_argv[i + 1] = argv[i];
++            soft_argv[soft_argc] = NULL;
++            OH_LOG_INFO(LOG_APP,
++                "HMOS in-process soft-exec %{public}s via wine_hmos_main loader=%{public}s argc=%{public}d target=%{public}s socket=%{public}s",
++                call ? call : "exec", hmos_loader, soft_argc,
++                (soft_argc > 2 && soft_argv[2]) ? soft_argv[2] : "<none>",
++                getenv("WINESERVERSOCKET") ? getenv("WINESERVERSOCKET") : "<unset>");
++            rc = box64_hmos_call_symbol(soft_argc, soft_argv, soft_env, "wine_hmos_main");
++            OH_LOG_INFO(LOG_APP, "HMOS in-process soft-exec wine_hmos_main returned rc=%{public}d; exiting process", rc);
++            free(soft_argv);
++            syscall(SYS_exit_group, rc < 0 ? 1 : rc);
++            __builtin_unreachable();
++        }
++        OH_LOG_WARN(LOG_APP, "HMOS in-process soft-exec argv allocation failed; falling back to ELF loader");
++    }
++    if (!(&box64_hmos_main) || !box64_hmos_main)
++        return 0;
++    OH_LOG_INFO(LOG_APP, "HMOS in-process soft-exec %{public}s via ELF path=%{public}s argc=%{public}d argv1=%{public}s socket=%{public}s",
++        call ? call : "exec", path ? path : "<none>", argc,
++        (argc > 1 && argv[1]) ? argv[1] : "<none>", getenv("WINESERVERSOCKET") ? getenv("WINESERVERSOCKET") : "<unset>");
++    rc = box64_hmos_main(argc, (const char**)argv, soft_env);
++    OH_LOG_INFO(LOG_APP, "HMOS in-process soft-exec ELF returned rc=%{public}d; exiting process", rc);
++    syscall(SYS_exit_group, rc < 0 ? 1 : rc);
++    __builtin_unreachable();
++}
++
++typedef int (*hmos_wineserver_spawn_fn)(const char* path, int* pid_out);
++static pid_t hmos_wineserver_fake_pid = -1;
++
++static int hmos_inprocess_is_fake_wineserver_pid(pid_t pid)
++{
++    return hmos_inprocess_is_active() && hmos_wineserver_fake_pid > 0 && pid == hmos_wineserver_fake_pid;
++}
++
++static pid_t hmos_inprocess_finish_fake_wineserver_wait(pid_t pid, int* status, const char* call)
++{
++    if (status)
++        *status = 0;
++    hmos_wineserver_fake_pid = -1;
++    printf_log(LOG_INFO, "HMOS in-process Wine server bridge satisfied %s for fake pid=%d\n",
++        call ? call : "wait", (int)pid);
++    OH_LOG_INFO(LOG_APP, "HMOS in-process wineserver bridge satisfied %{public}s fake pid=%{public}d",
++        call ? call : "wait", (int)pid);
++    return pid;
++}
++
++static const char* hmos_inprocess_rewrite_wine_tmp_path(const char* path, char* rewritten, size_t rewritten_size)
++{
++    static const char tmp_prefix[] = "/tmp/.wine-";
++    const char* wineprefix;
++    const char* suffix;
++    int written;
++
++    if (!hmos_inprocess_is_active() || !path || strncmp(path, tmp_prefix, sizeof(tmp_prefix) - 1))
++        return path;
++
++    wineprefix = getenv("WINEPREFIX");
++    if (!wineprefix || !wineprefix[0])
++        return path;
++
++    suffix = strchr(path + sizeof(tmp_prefix) - 1, '/');
++    if (!suffix)
++        suffix = "";
++
++    written = snprintf(rewritten, rewritten_size, "%s/.wineserver%s", wineprefix, suffix);
++    if (written <= 0 || (size_t)written >= rewritten_size)
++        return path;
++
++    printf_log(LOG_INFO, "HMOS in-process rewrote Wine server dir path %s -> %s\n", path, rewritten);
++    OH_LOG_INFO(LOG_APP, "HMOS in-process rewrote Wine server dir path %{public}s -> %{public}s",
++        path, rewritten);
++    return rewritten;
++}
++
++static const char* hmos_inprocess_virtual_dosdevice_target(const char* path)
++{
++    const char* wineprefix;
++    char dosdevices[MAX_PATH];
++    size_t len;
++    const char* name;
++    int written;
++
++    if (!hmos_inprocess_is_active() || !path)
++        return NULL;
++
++    wineprefix = getenv("WINEPREFIX");
++    if (!wineprefix || !wineprefix[0])
++        return NULL;
++
++    written = snprintf(dosdevices, sizeof(dosdevices), "%s/dosdevices/", wineprefix);
++    if (written <= 0 || (size_t)written >= sizeof(dosdevices))
++        return NULL;
++
++    len = strlen(dosdevices);
++    if (strncmp(path, dosdevices, len))
++        return NULL;
++
++    name = path + len;
++    if (strchr(name, '/'))
++        return NULL;
++    if (!strcmp(name, "c:"))
++        return "../drive_c";
++    if (!strcmp(name, "z:"))
++        return "/";
++    return NULL;
++}
++
++#define HMOS_PATCH_DOSDEVICE_LSTAT(path, stptr)                                      \
++    do {                                                                            \
++        const char* hmos_dos_target__ = hmos_inprocess_virtual_dosdevice_target(path); \
++        if (hmos_dos_target__) {                                                    \
++            (stptr)->st_mode = ((stptr)->st_mode & ~S_IFMT) | S_IFLNK | 0777;       \
++            (stptr)->st_size = strlen(hmos_dos_target__);                           \
++            if (!(stptr)->st_nlink)                                                 \
++                (stptr)->st_nlink = 1;                                              \
++        }                                                                           \
++    } while (0)
++
++static ssize_t hmos_inprocess_virtual_dosdevice_readlink(const char* path, char* buf, size_t sz)
++{
++    const char* target = hmos_inprocess_virtual_dosdevice_target(path);
++    size_t len;
++
++    if (!target)
++        return -1;
++    len = strlen(target);
++    if (sz > 0)
++        memcpy(buf, target, len < sz ? len : sz);
++    return len < sz ? (ssize_t)len : (ssize_t)sz;
++}
++
++static const char* hmos_inprocess_resolve_at_path(int fd, const char* path, char* resolved, size_t resolved_size)
++{
++    char fd_path[64];
++    char dir_path[MAX_PATH];
++    ssize_t len;
++    int written;
++
++    if (!path || path[0] == '/' || fd == AT_FDCWD)
++        return path;
++
++    written = snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", fd);
++    if (written <= 0 || (size_t)written >= sizeof(fd_path))
++        return path;
++
++    len = readlink(fd_path, dir_path, sizeof(dir_path) - 1);
++    if (len <= 0)
++        return path;
++    dir_path[len] = '\0';
++
++    written = snprintf(resolved, resolved_size, "%s/%s", dir_path, path);
++    if (written <= 0 || (size_t)written >= resolved_size)
++        return path;
++    return resolved;
++}
++
++static int hmos_inprocess_handle_wineserver_spawn(pid_t* pid, const char* call, const char* path)
++{
++    hmos_wineserver_spawn_fn spawn_fn;
++    int bridge_pid = -1;
++    int ret;
++
++    dlerror();
++    spawn_fn = (hmos_wineserver_spawn_fn)dlsym(RTLD_DEFAULT, "wine_hmos_server_spawn_wineserver");
++    if (!spawn_fn) {
++        errno = ENOSYS;
++        printf_log(LOG_NONE, "HMOS in-process mode cannot spawn Wine server on %s; native bridge symbol is missing\n",
++            path ? path : "<none>");
++        OH_LOG_ERROR(LOG_APP, "HMOS in-process wineserver bridge symbol missing for %{public}s via %{public}s",
++            path ? path : "<none>", call ? call : "spawn");
++        if (pid)
++            *pid = -1;
++        return ENOSYS;
++    }
++
++    ret = spawn_fn(path, &bridge_pid);
++    if (!ret) {
++        if (pid)
++            *pid = (pid_t)bridge_pid;
++        if (bridge_pid > 0)
++            hmos_wineserver_fake_pid = (pid_t)bridge_pid;
++        printf_log(LOG_INFO, "HMOS in-process Wine server bridge handled %s pid=%d\n",
++            path ? path : "<none>", bridge_pid);
++        OH_LOG_INFO(LOG_APP, "HMOS in-process wineserver bridge handled %{public}s pid=%{public}d",
++            path ? path : "<none>", bridge_pid);
++        return 0;
++    }
++
++    errno = ret;
++    if (pid)
++        *pid = -1;
++    printf_log(LOG_NONE, "HMOS in-process mode cannot spawn Wine server on %s; native bridge returned %d\n",
++        path ? path : "<none>", ret);
++    OH_LOG_ERROR(LOG_APP, "HMOS in-process wineserver bridge failed for %{public}s via %{public}s code=%{public}d",
++        path ? path : "<none>", call ? call : "spawn", ret);
++    return ret;
++}
++
++static int hmos_inprocess_handle_spawn_call(pid_t* pid, const char* call, const char* path, char* const argv[],
++                                            int* handled, uintptr_t caller, uintptr_t guest_rsp)
++{
++    const char* caller_name;
++    uintptr_t ret_addr;
++    const char* ret_name;
++    if (handled)
++        *handled = 0;
++    if (!hmos_inprocess_is_active())
++        return 0;
++    if (handled)
++        *handled = 1;
++    if (hmos_path_is_wineserver(path))
++        return hmos_inprocess_handle_wineserver_spawn(pid, call, path);
++    if (pid)
++        *pid = -1;
++    errno = ENOSYS;
++    caller_name = caller ? getAddrFunctionName(caller) : "<unknown>";
++    ret_addr = hmos_inprocess_guest_return(guest_rsp);
++    ret_name = ret_addr ? getAddrFunctionName(ret_addr) : "<unknown>";
++    hmos_inprocess_write_process_broker_request(call, path, argv, caller, guest_rsp);
++    printf_log(LOG_NONE, "HMOS in-process mode blocked guest %s on %s at %p/%s ret %p/%s; host process launch is not available\n",
++        call ? call : "spawn", path ? path : "<none>", (void*)caller, caller_name, (void*)ret_addr, ret_name);
++    OH_LOG_WARN(LOG_APP, "HMOS in-process blocked guest %{public}s on %{public}s at 0x%{public}llx/%{public}s ret 0x%{public}llx/%{public}s",
++        call ? call : "spawn", path ? path : "<none>", (unsigned long long)caller, caller_name,
++        (unsigned long long)ret_addr, ret_name);
++    return ENOSYS;
++}
++#else
++static const char* hmos_inprocess_rewrite_wine_tmp_path(const char* path, char* rewritten, size_t rewritten_size)
++{
++    (void)rewritten;
++    (void)rewritten_size;
++    return path;
++}
++#define HMOS_PATCH_DOSDEVICE_LSTAT(path, stptr) do { (void)(path); (void)(stptr); } while (0)
++static ssize_t hmos_inprocess_virtual_dosdevice_readlink(const char* path, char* buf, size_t sz)
++{
++    (void)path;
++    (void)buf;
++    (void)sz;
++    return -1;
++}
++static const char* hmos_inprocess_resolve_at_path(int fd, const char* path, char* resolved, size_t resolved_size)
++{
++    (void)fd;
++    (void)resolved;
++    (void)resolved_size;
++    return path;
++}
++#endif
++
++#ifdef BOX64_HMOS
++#define fstat64 fstat
++#define lstat64 lstat
++#define stat64 stat
++#define fopen64 fopen
++#define ftw64 ftw
++#define open64 open
++#define fstatat64 fstatat
++#define nftw64 nftw
++#define scandir64 scandir
++#define mmap64 mmap
++#endif
++
+ static int regs_abi[] = {_DI, _SI, _DX, _CX, _R8, _R9};
+ void* getVargN(x64emu_t *emu, int n)
+ {
+@@ -685,6 +1236,10 @@ int my_dl_iterate_phdr(x64emu_t *emu, void* F, void *data);
+ 
+ pid_t EXPORT my_fork(x64emu_t* emu)
+ {
++#ifdef BOX64_HMOS
++    if (hmos_inprocess_forbid_process_call("fork", NULL, NULL, R_RIP, R_RSP))
++        return -1;
++#endif
+     #if 1
+     emu->quit = 1;
+     emu->fork = 1;  // use regular fork...
+@@ -720,6 +1275,10 @@ pid_t EXPORT my_fork(x64emu_t* emu)
+ pid_t EXPORT my___fork(x64emu_t* emu) __attribute__((alias("my_fork")));
+ pid_t EXPORT my_vfork(x64emu_t* emu)
+ {
++#ifdef BOX64_HMOS
++    if (hmos_inprocess_forbid_process_call("vfork", NULL, NULL, R_RIP, R_RSP))
++        return -1;
++#endif
+     #if 1
+     emu->quit = 1;
+     emu->fork = 3;  // use regular fork...
+@@ -1703,6 +2262,8 @@ EXPORT int my___xstat(x64emu_t* emu, int v, void* path, void* buf)
+     (void)emu; (void)v;
+     struct stat64 st;
+     int r = stat64((const char*)path, buf?&st:buf);
++    if(buf && !r)
++        HMOS_PATCH_DOSDEVICE_LSTAT((const char*)path, &st);
+     if(buf && !r)
+         UnalignStat64(&st, buf);
+     return r;
+@@ -1714,6 +2275,8 @@ EXPORT int my___lxstat(x64emu_t* emu, int v, void* name, void* buf)
+     (void)emu; (void)v;
+     struct stat64 st;
+     int r = lstat64((const char*)name, buf?&st:buf);
++    if(buf && !r)
++        HMOS_PATCH_DOSDEVICE_LSTAT((const char*)name, &st);
+     if(buf && !r)
+         UnalignStat64(&st, buf);
+     return r;
+@@ -1734,8 +2297,12 @@ EXPORT int my___fxstatat64(x64emu_t* emu, int v, int d, void* path, void* buf, i
+ EXPORT int my_stat(x64emu_t *emu, void* filename, void* buf)
+ {
+     (void)emu;
++    char hmos_path[MAX_PATH];
++    filename = (void*)hmos_inprocess_rewrite_wine_tmp_path((const char*)filename, hmos_path, sizeof(hmos_path));
+     struct stat st;
+     int r = stat(filename, &st);
++    if(!r)
++        HMOS_PATCH_DOSDEVICE_LSTAT((const char*)filename, &st);
+     if(!r)
+         UnalignStat64(&st, buf);
+     return r;
+@@ -1745,8 +2312,12 @@ EXPORT int my_stat64(x64emu_t *emu, void* filename, void* buf) __attribute__((al
+ EXPORT int my_lstat(x64emu_t *emu, void* filename, void* buf)
+ {
+     (void)emu;
++    char hmos_path[MAX_PATH];
++    filename = (void*)hmos_inprocess_rewrite_wine_tmp_path((const char*)filename, hmos_path, sizeof(hmos_path));
+     struct stat st;
+     int r = lstat(filename, &st);
++    if(!r)
++        HMOS_PATCH_DOSDEVICE_LSTAT((const char*)filename, &st);
+     if(!r)
+         UnalignStat64(&st, buf);
+     return r;
+@@ -2090,6 +2661,9 @@ static long isProcMem(const char* path)
+ 
+ EXPORT ssize_t my_readlink(x64emu_t* emu, void* path, void* buf, size_t sz)
+ {
++    ssize_t hmos_ret = hmos_inprocess_virtual_dosdevice_readlink((const char*)path, (char*)buf, sz);
++    if (hmos_ret >= 0)
++        return hmos_ret;
+     if(isProcSelf((const char*)path, "exe")) {
+         // special case for self...
+         return strlen(strncpy((char*)buf, emu->context->fullpath, sz));
+@@ -2250,7 +2824,7 @@ void CreateCpuCacheSize(int fd, int cpu, int index)
+     (void)dummy;
+ }
+ 
+-#ifdef ANDROID
++#if defined(ANDROID) && !defined(BOX64_HMOS)
+ static int shm_open(const char *name, int oflag, mode_t mode) {
+     return -1;
+ }
+@@ -2269,8 +2843,50 @@ static int shm_unlink(const char *name) {
+ #define TMP_CPUCACHE_ASSOC "box64_cpucacheassoc"
+ #define TMP_CPUCACHE_COHER "box64_cpucachecoher"
+ #define TMP_CPUCACHE_SIZE "box64_cpucachesize"
++EXPORT int32_t my_access(x64emu_t* emu, const char* pathname, int32_t mode)
++{
++    (void)emu;
++    char hmos_path[MAX_PATH];
++    pathname = hmos_inprocess_rewrite_wine_tmp_path(pathname, hmos_path, sizeof(hmos_path));
++    return access(pathname, mode);
++}
++
++EXPORT int32_t my_chdir(x64emu_t* emu, const char* path)
++{
++    (void)emu;
++    char hmos_path[MAX_PATH];
++    path = hmos_inprocess_rewrite_wine_tmp_path(path, hmos_path, sizeof(hmos_path));
++    return chdir(path);
++}
++
++EXPORT int32_t my_chmod(x64emu_t* emu, const char* path, uint32_t mode)
++{
++    (void)emu;
++    char hmos_path[MAX_PATH];
++    path = hmos_inprocess_rewrite_wine_tmp_path(path, hmos_path, sizeof(hmos_path));
++    return chmod(path, mode);
++}
++
++EXPORT int32_t my_mkdir(x64emu_t* emu, const char* path, uint32_t mode)
++{
++    (void)emu;
++    char hmos_path[MAX_PATH];
++    path = hmos_inprocess_rewrite_wine_tmp_path(path, hmos_path, sizeof(hmos_path));
++    return mkdir(path, mode);
++}
++
++EXPORT int32_t my_unlink(x64emu_t* emu, const char* path)
++{
++    (void)emu;
++    char hmos_path[MAX_PATH];
++    path = hmos_inprocess_rewrite_wine_tmp_path(path, hmos_path, sizeof(hmos_path));
++    return unlink(path);
++}
++
+ EXPORT int32_t my_open(x64emu_t* emu, void* pathname, int32_t flags, uint32_t mode)
+ {
++    char hmos_path[MAX_PATH];
++    pathname = (void*)hmos_inprocess_rewrite_wine_tmp_path((const char*)pathname, hmos_path, sizeof(hmos_path));
+     if(isProcSelf((const char*) pathname, "cmdline")) {
+         // special case for self command line...
+         #if 0
+@@ -2672,6 +3288,29 @@ EXPORT int my_scandir64(x64emu_t *emu, void* dir, void* namelist, void* sel, voi
+ }
+ EXPORT int my_scandir(x64emu_t *emu, void* dir, void* namelist, void* sel, void* comp) __attribute__((alias("my_scandir64")));
+ 
++#ifdef BOX64_HMOS
++static int box64_hmos_scandirat(int dirfd, const char* dirp, struct dirent64*** namelist,
++                                int (*filter)(const struct dirent64*),
++                                int (*compar)(const struct dirent64**, const struct dirent64**))
++{
++    const char* rel = dirp ? dirp : ".";
++    if (dirfd == AT_FDCWD || rel[0] == '/') {
++        return scandir64(rel, namelist, filter, compar);
++    }
++
++    char path[4096];
++    int written = snprintf(path, sizeof(path), "/proc/self/fd/%d/%s", dirfd, rel);
++    if (written < 0 || (size_t)written >= sizeof(path)) {
++        errno = ENAMETOOLONG;
++        return -1;
++    }
++
++    return scandir64(path, namelist, filter, compar);
++}
++#define scandirat box64_hmos_scandirat
++#define scandirat64 box64_hmos_scandirat
++#endif
++
+ EXPORT int my_scandirat(x64emu_t *emu, int dirfd, void* dirp, void* namelist, void* sel, void* comp)
+ {
+     (void)emu;
+@@ -2704,6 +3343,12 @@ EXPORT char** my___environ = NULL;  // all aliases
+ 
+ EXPORT int32_t my_execv(x64emu_t* emu, const char* path, char* const argv[])
+ {
++#ifdef BOX64_HMOS
++    if (hmos_inprocess_try_soft_exec_wine_loader("execv", path, argv, NULL))
++        return -1;
++    if (hmos_inprocess_forbid_process_call("execv", path, argv, R_RIP, R_RSP))
++        return -1;
++#endif
+     int ret;
+     int n = 0;
+     int self = isProcSelf(path, "exe");
+@@ -2797,6 +3442,12 @@ EXPORT int32_t my_execv(x64emu_t* emu, const char* path, char* const argv[])
+ 
+ EXPORT int32_t my_execve(x64emu_t* emu, const char* path, char* const argv[], char* const envp[])
+ {
++#ifdef BOX64_HMOS
++    if (hmos_inprocess_try_soft_exec_wine_loader("execve", path, argv, envp))
++        return -1;
++    if (hmos_inprocess_forbid_process_call("execve", path, argv, R_RIP, R_RSP))
++        return -1;
++#endif
+     int self = isProcSelf(path, "exe");
+     int x64 = FileIsX64ELF(path);
+     int x86 = my_context->box86path?FileIsX86ELF(path):0;
+@@ -2912,6 +3563,12 @@ EXPORT int32_t my_execve(x64emu_t* emu, const char* path, char* const argv[], ch
+ // execvp should use PATH to search for the program first
+ EXPORT int32_t my_execvp(x64emu_t* emu, const char* path, char* const argv[])
+ {
++#ifdef BOX64_HMOS
++    if (hmos_inprocess_try_soft_exec_wine_loader("execvp", path, argv, NULL))
++        return -1;
++    if (hmos_inprocess_forbid_process_call("execvp", path, argv, R_RIP, R_RSP))
++        return -1;
++#endif
+     // need to use BOX64_PATH / PATH here...
+     char* fullpath = ResolveFileSoft(path, &my_context->box64_path);
+     // use fullpath...
+@@ -2971,6 +3628,12 @@ EXPORT int32_t my_execvp(x64emu_t* emu, const char* path, char* const argv[])
+ // execvp should use PATH to search for the program first
+ EXPORT int32_t my_execvpe(x64emu_t* emu, const char* path, char* argv[], char* const envp[])
+ {
++#ifdef BOX64_HMOS
++    if (hmos_inprocess_try_soft_exec_wine_loader("execvpe", path, argv, envp))
++        return -1;
++    if (hmos_inprocess_forbid_process_call("execvpe", path, argv, R_RIP, R_RSP))
++        return -1;
++#endif
+     // need to use BOX64_PATH / PATH here...
+     char* fullpath = ResolveFileSoft(path, &my_context->box64_path);
+     // use fullpath...
+@@ -3175,6 +3838,12 @@ EXPORT int32_t my_execlp(x64emu_t* emu, const char* path)
+ EXPORT int32_t my_posix_spawn(x64emu_t* emu, pid_t* pid, const char* fullpath,
+     const posix_spawn_file_actions_t *actions, const posix_spawnattr_t* attrp,  char* const argv[], char* const envp[])
+ {
++#ifdef BOX64_HMOS
++    int hmos_handled = 0;
++    int hmos_result = hmos_inprocess_handle_spawn_call(pid, "posix_spawn", fullpath, argv, &hmos_handled, R_RIP, R_RSP);
++    if (hmos_handled)
++        return hmos_result;
++#endif
+     int self = isProcSelf(fullpath, "exe");
+     int x64 = FileIsX64ELF(fullpath);
+     int x86 = my_context->box86path?FileIsX86ELF(fullpath):0;
+@@ -3216,6 +3885,12 @@ EXPORT int32_t my_posix_spawn(x64emu_t* emu, pid_t* pid, const char* fullpath,
+ EXPORT int32_t my_posix_spawnp(x64emu_t* emu, pid_t* pid, const char* path,
+     const posix_spawn_file_actions_t *actions, const posix_spawnattr_t* attrp,  char* const argv[], char* const envp[])
+ {
++#ifdef BOX64_HMOS
++    int hmos_handled = 0;
++    int hmos_result = hmos_inprocess_handle_spawn_call(pid, "posix_spawnp", path, argv, &hmos_handled, R_RIP, R_RSP);
++    if (hmos_handled)
++        return hmos_result;
++#endif
+     // need to use BOX64_PATH / PATH here...
+     char* fullpath = ResolveFileSoft(path, &my_context->box64_path);
+     // use fullpath...
+@@ -3257,6 +3932,34 @@ EXPORT int32_t my_posix_spawnp(x64emu_t* emu, pid_t* pid, const char* path,
+     return ret;
+ }
+ 
++EXPORT int32_t my_waitpid(x64emu_t* emu, pid_t pid, int* status, int options)
++{
++    (void)emu;
++#ifdef BOX64_HMOS
++    if (hmos_inprocess_is_fake_wineserver_pid(pid))
++        return hmos_inprocess_finish_fake_wineserver_wait(pid, status, "waitpid");
++#endif
++    return waitpid(pid, status, options);
++}
++
++EXPORT int32_t my___waitpid(x64emu_t* emu, pid_t pid, int* status, int options)
++{
++    return my_waitpid(emu, pid, status, options);
++}
++
++EXPORT int32_t my_wait4(x64emu_t* emu, pid_t pid, int* status, int options, struct rusage* usage)
++{
++    (void)emu;
++#ifdef BOX64_HMOS
++    if (hmos_inprocess_is_fake_wineserver_pid(pid)) {
++        if (usage)
++            memset(usage, 0, sizeof(*usage));
++        return hmos_inprocess_finish_fake_wineserver_wait(pid, status, "wait4");
++    }
++#endif
++    return wait4(pid, status, options, usage);
++}
++
+ EXPORT void my__Jv_RegisterClasses() {}
+ 
+ EXPORT int32_t my___cxa_thread_atexit_impl(x64emu_t* emu, void* dtor, void* obj, void* dso)
+@@ -3557,6 +4260,11 @@ EXPORT void* my_realpath(x64emu_t* emu, void* path, void* resolved_path)
+ 
+ EXPORT int my_readlinkat(x64emu_t* emu, int fd, void* path, void* buf, size_t bufsize)
+ {
++    char hmos_path[MAX_PATH];
++    const char* resolved_path = hmos_inprocess_resolve_at_path(fd, (const char*)path, hmos_path, sizeof(hmos_path));
++    ssize_t hmos_ret = hmos_inprocess_virtual_dosdevice_readlink(resolved_path, (char*)buf, bufsize);
++    if (hmos_ret >= 0)
++        return hmos_ret;
+     if((fd==AT_FDCWD) && isProcSelf(path, "exe")) {
+         strncpy(buf, my_context->fullpath, bufsize);
+         size_t l = strlen(my_context->fullpath);
+@@ -3583,6 +4291,38 @@ EXPORT void* my_mmap64(x64emu_t* emu, void *addr, size_t length, int prot, int f
+     (void)emu;
+     if(BOX64ENV(dynarec_log)>=LOG_DEBUG) {printf_log(LOG_NONE, "mmap64(%p, 0x%zx, 0x%x, 0x%x, %d, %zd) ", addr, length, prot, flags, fd, offset);}
+     void* ret = box_mmap(addr, length, prot, flags, fd, offset);
++#ifdef BOX64_HMOS_INPROCESS
++    if(ret==MAP_FAILED && addr==(void*)0x7ffe0000 && length==0x1000 && fd==-1) {
++        const int first_errno = errno;
++        int fixed_flags = (flags | MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS) & ~MAP_FIXED_NOREPLACE;
++        InternalMunmap(addr, length);
++        ret = box_mmap(addr, length, prot, fixed_flags, fd, offset);
++        if(ret!=MAP_FAILED) {
++            printf_log(LOG_INFO, "HMOS mapped Wine shared user data addr=%p len=0x%zx prot=0x%x flags=0x%x->0x%x first_errno=%d\n",
++                addr, length, prot, flags, fixed_flags, first_errno);
++        } else {
++            printf_log(LOG_INFO, "HMOS failed Wine shared user data addr=%p len=0x%zx prot=0x%x flags=0x%x->0x%x first_errno=%d retry_errno=%d\n",
++                addr, length, prot, flags, fixed_flags, first_errno, errno);
++        }
++    }
++    if(ret==MAP_FAILED && addr && fd==-1 && (flags&MAP_FIXED_NOREPLACE) &&
++       (have48bits || ((uintptr_t)addr <= 0x7fffffffffULL && length <= (0x7fffffffffULL - (uintptr_t)addr)))) {
++        const int first_errno = errno;
++        if(isBlockFree(addr, length)) {
++            int fixed_flags = (flags | MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS) & ~MAP_FIXED_NOREPLACE;
++            ret = box_mmap(addr, length, prot, fixed_flags, fd, offset);
++            if(ret!=MAP_FAILED) {
++                printf_log(LOG_DEBUG, "HMOS MAP_FIXED_NOREPLACE fallback mapped addr=%p len=0x%zx prot=0x%x flags=0x%x->0x%x first_errno=%d\n",
++                    addr, length, prot, flags, fixed_flags, first_errno);
++            } else {
++                printf_log(LOG_INFO, "HMOS MAP_FIXED_NOREPLACE fallback failed addr=%p len=0x%zx prot=0x%x flags=0x%x->0x%x first_errno=%d retry_errno=%d\n",
++                    addr, length, prot, flags, fixed_flags, first_errno, errno);
++            }
++        } else if(first_errno==ENOSYS || first_errno==EINVAL || first_errno==EOPNOTSUPP) {
++            errno = EEXIST;
++        }
++    }
++#endif
+     int e = errno;
+     if(emu && box64_is32bits && ret!=MAP_FAILED && ((ret>(void*)0xc0000000) || (ret+length>(void*)0xc0000000))) {
+         // do not allow allocating memory that high for 32bits process
+@@ -3749,7 +4489,12 @@ EXPORT int my_mprotect(x64emu_t* emu, void *addr, unsigned long len, int prot)
+     if(emu && (BOX64ENV(log)>=LOG_DEBUG || BOX64ENV(dynarec_log)>=LOG_DEBUG)) {printf_log(LOG_NONE, "mprotect(%p, 0x%lx, 0x%x)\n", addr, len, prot);}
+     if(prot&PROT_WRITE)
+         prot|=PROT_READ;    // PROT_READ is implicit with PROT_WRITE on x86_64
+-    int ret = mprotect(addr, len, prot);
++#ifdef BOX64_HMOS_INPROCESS
++    int host_prot = hmos_guest_host_prot(prot);
++#else
++    int host_prot = prot;
++#endif
++    int ret = mprotect(addr, len, host_prot);
+     #ifdef DYNAREC
+     if(BOX64ENV(dynarec) && !ret && len) {
+         if(prot& PROT_EXEC) {
+@@ -3937,6 +4682,8 @@ EXPORT int my_nanosleep(const struct timespec *req, struct timespec *rem)
+ // DL functions from wrappedlibdl.c
+ void* my_dlopen(x64emu_t* emu, void *filename, int flag);
+ int my_dlclose(x64emu_t* emu, void *handle);
++char* my_dlerror(x64emu_t* emu);
++int my_dladdr(x64emu_t* emu, void *addr, void *info);
+ void* my_dlsym(x64emu_t* emu, void *handle, void *symbol);
+ EXPORT int my___libc_dlclose(x64emu_t* emu, void* handle)
+ {
+@@ -4053,7 +4800,7 @@ EXPORT void my_mcount(void* frompc, void* selfpc)
+ }
+ #endif
+ 
+-#ifndef ANDROID
++#if !defined(ANDROID) || defined(BOX64_HMOS)
+ union semun {
+   int              val;    /* Value for SETVAL */
+   struct semid_ds *buf;    /* Buffer for IPC_STAT, IPC_SET */
+@@ -4438,6 +5185,10 @@ EXPORT __uint128_t my___udivti3(__uint128_t a, __uint128_t b)
+ extern int box64_quit;
+ extern int box64_exit_code;
+ void endBox64();
++static int is_hmos_inprocess_mode(void)
++{
++    return &box64_hmos_inprocess_mode && box64_hmos_inprocess_mode;
++}
+ static void* timed_exit_thread(void* a)
+ {
+     // this is a workaround for some NVidia drivers on ARM64 that may freeze at exit
+@@ -4459,6 +5210,13 @@ void startTimedExit()
+ 
+ EXPORT void my_exit(x64emu_t* emu, int code)
+ {
++    if(is_hmos_inprocess_mode()) {
++        emu->quit = 1;
++        R_EAX = code;
++        emu->flags.quitonexit = 2;
++        box64_exit_code = code;
++        return;
++    }
+     if(emu->flags.quitonexit) {
+         emu->quit = 1;
+         R_EAX = code;
+@@ -4474,6 +5232,13 @@ EXPORT void my_exit(x64emu_t* emu, int code)
+ 
+ EXPORT void my__exit(x64emu_t* emu, int code)
+ {
++    if(is_hmos_inprocess_mode()) {
++        emu->quit = 1;
++        R_EAX = code;
++        emu->flags.quitonexit = 2;
++        box64_exit_code = code;
++        return;
++    }
+     if(emu->flags.quitonexit || emu->quit) {
+         _exit(code);
+     }
+@@ -4489,6 +5254,10 @@ EXPORT void my__exit(x64emu_t* emu, int code)
+ EXPORT int my_prctl(x64emu_t* emu, int option, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long arg5)
+ {
+     if(option==PR_SET_NAME) {
++#ifdef BOX64_HMOS_INPROCESS
++        printf_log(LOG_DEBUG, "HMOS ignoring prctl(PR_SET_NAME, %p)\n", (void*)arg2);
++        return 0;
++#else
+         printf_log(LOG_DEBUG, "set process name to \"%s\"\n", (char*)arg2);
+         ApplyEnvFileEntry((char*)arg2);
+         size_t l = strlen((char*)arg2);
+@@ -4496,6 +5265,7 @@ EXPORT int my_prctl(x64emu_t* emu, int option, unsigned long arg2, unsigned long
+             printf_log(LOG_DEBUG, "hacking orig command line to \"%s\"\n", (char*)arg2);
+             strcpy(my_context->orig_argv[0], (char*)arg2);
+         }
++#endif
+     }
+     if(option==PR_SET_SECCOMP) {
+         printf_log(LOG_DEBUG, "Ignoring prctl(PR_SET_SECCOMP, ...)\n");
+diff --git a/src/wrapped/wrappedlibc_private.h b/src/wrapped/wrappedlibc_private.h
+index cdc3f30..af3fe81 100644
+--- a/src/wrapped/wrappedlibc_private.h
++++ b/src/wrapped/wrappedlibc_private.h
+@@ -8,7 +8,7 @@ GO(abort, vFv)
+ GO(abs, iFi)
+ GO(accept, iFipp)
+ GO(accept4, iFippi)
+-GOW(access, iFpi)
++GOWM(access, iFEpi)
+ GO(acct, iFp)
+ GOW(addmntent, iFSp)
+ GOW(addseverity, iFip)
+@@ -111,11 +111,11 @@ GO(cfree, vFp)
+ GO(cfsetispeed, iFpu)
+ GO(cfsetospeed, iFpu)
+ GO(cfsetspeed, iFpu)
+-GOW(chdir, iFp)
++GOWM(chdir, iFEp)
+ DATA(__check_rhosts_file, 8)
+ //GO(chflags, 
+ //GO(__chk_fail, 
+-GOW(chmod, iFpu)
++GOWM(chmod, iFEpu)
+ GOW(chown, iFpuu)
+ GO(chroot, iFp)
+ GOW(clearenv, iFv)
+@@ -1175,6 +1175,11 @@ GOM(__libc_dlclose, iFEp)
+ GOM(__libc_dlopen_mode, pFEpi)
+ GOM(__libc_dlsym, pFEpp)
+ //GO(__libc_dlvsym, 
++GOM(dladdr, iFEpp)
++GOM(dlclose, iFEp)
++GOM(dlerror, pFEv)
++GOM(dlopen, pFEpi)
++GOM(dlsym, pFEpp)
+ //GO(__libc_dynarray_at_failure, 
+ //GO(__libc_dynarray_emplace_enlarge, 
+ //GO(__libc_dynarray_finalize, 
+@@ -1307,7 +1312,7 @@ GO(__memset_chk, pFpiLL)
+ //GO(__mempcpy_small, 
+ //GO(__merge_grp, 
+ GO(mincore, iFpLp)
+-GOW(mkdir, iFpu)
++GOWM(mkdir, iFEpu)
+ GO(mkdirat, iFipu)
+ GO(mkdtemp, pFp)
+ GO(mkfifo, iFpu)
+@@ -1862,6 +1867,8 @@ GO(shmat, pFipi)
+ GO(shmctl, iFiip)
+ GO(shmdt, iFp)
+ GO(shmget, iFiLi)
++GO(shm_open, iFpOu)
++GO(shm_unlink, iFp)
+ GOW(shutdown, iFii)
+ GOWM(__sigaction, iFEipp)
+ GOWM(sigaction, iFEipp)
+@@ -2306,7 +2313,7 @@ GOWM(uname, iFp)
+ GO(__underflow, iFp)
+ GOW(ungetc, iFiS)
+ GO(ungetwc, uFuS)
+-GOW(unlink, iFp)
++GOWM(unlink, iFEp)
+ GO(unlinkat, iFipi)
+ GO(unlockpt, iFi)
+ GOW(unsetenv, iFp)
+@@ -2373,10 +2380,10 @@ GOM(vwscanf, iFpA)
+ GOW(__wait, iFp)
+ GOW(wait, iFp)
+ GOW(wait3, iFpip)
+-GOW(wait4, iFipip)
++GOWM(wait4, iFEipip)
+ GOW(waitid, iFuupi)
+-GO(__waitpid, iFipi)
+-GOW(waitpid, iFipi)
++GOWM(__waitpid, iFEipi)
++GOWM(waitpid, iFEipi)
+ GOM(warn, vFEpV)
+ GOM(warnx, vFEpV)
+ GOW(wcpcpy, pFpp)
+diff --git a/src/wrapped/wrappedlibdl.c b/src/wrapped/wrappedlibdl.c
+index 898b678..03dee2c 100644
+--- a/src/wrapped/wrappedlibdl.c
++++ b/src/wrapped/wrappedlibdl.c
+@@ -243,6 +243,22 @@ void* my_dlopen(x64emu_t* emu, void *filename, int flag)
+             my_context->deferredInitCap = old_deferredInitCap;
+             return NULL;
+         }
++        if(!tmp->libs[0]) {
++            printf_dlsym(strchr(rfilename,'/')?LOG_DEBUG:LOG_INFO, "Warning: Cannot dlopen(\"%s\"/%p, %X)\n", rfilename, filename, flag);
++            #ifdef BOX64_HMOS_INPROCESS
++            printf_log(LOG_NONE, "HMOS dlopen: missing library object after AddNeededLib name=%s\n", rfilename);
++            #endif
++            SET_ERROR("Cannot dlopen(\"%s\"/%p, %X)\n", rfilename, filename, flag);
++            RemoveNeededLib(NULL, is_local, tmp, my_context, emu);
++            free_neededlib(tmp);
++            if(my_context->deferredInitList)
++                box_free(my_context->deferredInitList);
++            my_context->deferredInit = old_deferredInit;
++            my_context->deferredInitList = old_deferredInitList;
++            my_context->deferredInitSz = old_deferredInitSz;
++            my_context->deferredInitCap = old_deferredInitCap;
++            return NULL;
++        }
+         setupTraceMapLib(tmp->libs[0]->maplib);
+         free_neededlib(tmp);
+         lib = GetLibInternal(rfilename);

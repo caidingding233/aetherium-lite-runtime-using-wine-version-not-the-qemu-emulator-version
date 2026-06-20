@@ -1,0 +1,27 @@
+Aetherium Lite Runtime Repository Licensing
+
+This repository is a mixed-license source and patch repository.
+
+Original Aetherium glue files are licensed under the MIT License. That includes
+repository documentation, manifests, and scripts written specifically for this
+project, unless a file says otherwise.
+
+Patch files and copied license texts follow the license of the upstream project
+they modify or describe:
+
+- third_party/proton-runtime/source-patches/proton: Proton upstream terms and
+  bundled third-party licenses.
+- third_party/proton-runtime/source-patches/box64: Box64 MIT License.
+- third_party/proton-runtime/source-patches/wine: Wine LGPL-2.1-or-later.
+- third_party/proton-runtime/source-patches/dxvk: DXVK zlib/libpng-style
+  License.
+- third_party/proton-runtime/source-patches/vkd3d-proton: vkd3d-proton
+  LGPL-2.1.
+
+Copies of upstream license files are stored under LICENSES/. The MIT text for
+original Aetherium glue code is stored at LICENSES/aetherium/MIT.txt.
+
+Do not treat this whole repository as MIT-only. Binary releases built from these
+sources must keep notices for every bundled runtime component and must provide
+corresponding source for LGPL-covered modified components such as Wine and
+vkd3d-proton.

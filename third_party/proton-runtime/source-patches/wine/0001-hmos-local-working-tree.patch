@@ -1,0 +1,119 @@
+diff --git a/dlls/ntdll/unix/process.c b/dlls/ntdll/unix/process.c
+index 418f95b..ef382c5 100644
+--- a/dlls/ntdll/unix/process.c
++++ b/dlls/ntdll/unix/process.c
+@@ -397,6 +397,47 @@ static BOOL is_unix_console_handle( HANDLE handle )
+ }
+ 
+ 
++/***********************************************************************
++ *           hmos_spawn_process
++ */
++static NTSTATUS hmos_spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int socketfd,
++                                    int unixdir, char *winedebug, const struct pe_image_info *pe_info )
++{
++    const char *broker_dir = getenv( "WINE_HMOS_PROCESS_BROKER_DIR" );
++    const char *backend = getenv( "WINE_HMOS_EXEC_BACKEND" );
++    char path[1024];
++    FILE *file;
++
++    if (!broker_dir || !broker_dir[0]) return STATUS_NOT_IMPLEMENTED;
++
++    snprintf( path, sizeof(path), "%s/request-%lu-%ld.txt", broker_dir,
++              (unsigned long)time(NULL), (long)getpid() );
++    if ((file = fopen( path, "w" )))
++    {
++        fprintf( file, "version=1\n" );
++        fprintf( file, "backend=%s\n", backend ? backend : "" );
++        fprintf( file, "pid=%ld\n", (long)getpid() );
++        fprintf( file, "socketfd=%d\n", socketfd );
++        fprintf( file, "unixdir=%d\n", unixdir );
++        fprintf( file, "winedebug=%s\n", winedebug ? winedebug : "" );
++        fprintf( file, "cmd=%s\n", debugstr_us( &params->CommandLine ) );
++        fprintf( file, "image=%s\n", debugstr_us( &params->ImagePathName ) );
++        fprintf( file, "machine=%04x\n", pe_info ? pe_info->machine : 0 );
++        fclose( file );
++        WARN( "HMOS process broker request queued backend=%s path=%s cmd=%s\n",
++              backend ? backend : "", debugstr_a(path), debugstr_us( &params->CommandLine ) );
++    }
++    else WARN( "HMOS process broker request write failed dir=%s errno=%d\n",
++               debugstr_a(broker_dir), errno );
++
++    if (getenv( "WINE_HMOS_REQUIRE_PROCESS_BROKER" ))
++        return STATUS_NO_MEMORY;
++
++    WARN( "HMOS process broker runtime bridge is not attached yet; falling back to Unix spawn path\n" );
++    return STATUS_NOT_IMPLEMENTED;
++}
++
++
+ /***********************************************************************
+  *           spawn_process
+  */
+@@ -408,6 +449,13 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
+     pid_t pid;
+     char **argv;
+ 
++    if (getenv( "WINE_HMOS_PROCESS_BROKER_DIR" ))
++    {
++        status = hmos_spawn_process( params, socketfd, unixdir, winedebug, pe_info );
++        if (status != STATUS_NOT_IMPLEMENTED) return status;
++        status = STATUS_SUCCESS;
++    }
++
+     if (wine_server_handle_to_fd( params->hStdInput, FILE_READ_DATA, &stdin_fd, NULL ) &&
+         isatty(0) && is_unix_console_handle( params->hStdInput ))
+         stdin_fd = 0;
+diff --git a/server/unicode.c b/server/unicode.c
+index bb39b55..9f8da47 100644
+--- a/server/unicode.c
++++ b/server/unicode.c
+@@ -327,10 +327,12 @@ static char *get_nls_dir(void)
+ /* load the case mapping table */
+ struct fd *load_intl_file(void)
+ {
+-    static const char *nls_dirs[] = { NULL, DATADIR "/wine/nls", "/usr/local/share/wine/nls", "/usr/share/wine/nls" };
++    const char *nls_dirs[] = { NULL, NULL, DATADIR "/wine/nls", "/usr/local/share/wine/nls", "/usr/share/wine/nls" };
+     static const WCHAR nt_pathW[] = {'C',':','\\','w','i','n','d','o','w','s','\\',
+         's','y','s','t','e','m','3','2','\\','l','_','i','n','t','l','.','n','l','s',0};
+     static const struct unicode_str nt_name = { nt_pathW, sizeof(nt_pathW) };
++    const char *hmos_runtime_root;
++    char *hmos_nls_dir = NULL;
+     unsigned int i, offset, size;
+     unsigned short data;
+     char *path;
+@@ -339,6 +341,13 @@ struct fd *load_intl_file(void)
+     mode_t mode = 0600;
+ 
+     nls_dirs[0] = get_nls_dir();
++    hmos_runtime_root = getenv( "WINE_HMOS_RUNTIME_ROOT" );
++    if (hmos_runtime_root && *hmos_runtime_root)
++    {
++        if (asprintf( &hmos_nls_dir, "%s/files/share/wine/nls", hmos_runtime_root ) != -1)
++            nls_dirs[1] = hmos_nls_dir;
++    }
++
+     for (i = 0; i < ARRAY_SIZE( nls_dirs ); i++)
+     {
+         if (!nls_dirs[i]) continue;
+@@ -348,7 +357,12 @@ struct fd *load_intl_file(void)
+                            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT ))) break;
+         free( path );
+     }
+-    if (!fd) fatal_error( "failed to load l_intl.nls\n" );
++    if (!fd)
++    {
++        free( hmos_nls_dir );
++        fatal_error( "failed to load l_intl.nls\n" );
++    }
++    free( hmos_nls_dir );
+     unix_fd = get_unix_fd( fd );
+     /* read initial offset */
+     if (pread( unix_fd, &data, sizeof(data), 0 ) != sizeof(data) || !data) goto failed;
+@@ -367,5 +381,6 @@ struct fd *load_intl_file(void)
+     return fd;
+ 
+ failed:
++    free( hmos_nls_dir );
+     fatal_error( "invalid format for casemap table %s\n", path );
+ }
