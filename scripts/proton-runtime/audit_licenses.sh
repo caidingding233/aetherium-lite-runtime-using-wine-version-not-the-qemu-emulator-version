@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SRC_DIR="${ROOT_DIR}/third_party/proton-runtime/src"
-LICENSE_DIR="${ROOT_DIR}/LICENSES"
+LICENSE_DIR="${PROTON_RUNTIME_LICENSE_DIR:-${ROOT_DIR}/LICENSES}"
 
 show_license_files() {
   local name="$1"

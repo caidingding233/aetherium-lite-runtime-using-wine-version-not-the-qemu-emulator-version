@@ -35,27 +35,36 @@ MIT, but Wine/vkd3d-proton runtime modifications remain LGPL-covered.
 ```bash
 git clone https://github.com/caidingding233/aetherium-lite-runtime-using-wine-version-not-the-qemu-emulator-version.git
 cd aetherium-lite-runtime-using-wine-version-not-the-qemu-emulator-version
+scripts/proton-runtime/bootstrap_runtime_sources.sh
+```
+
+The bootstrap helper checks out the verified commits recorded in
+`third_party/proton-runtime/manifest.json`, applies the Aetherium source
+patches, verifies the HMOS in-process source files, and audits top-level
+license files.
+
+To fetch upstream sources without applying Aetherium patches:
+
+```bash
 scripts/proton-runtime/fetch_sources.sh
 ```
 
-The fetch helper checks out the verified commits recorded in
-`third_party/proton-runtime/manifest.json` by default. To follow upstream branch
-heads instead:
+To follow upstream branch heads instead of the verified commits:
 
 ```bash
-PROTON_RUNTIME_PINNED=0 scripts/proton-runtime/fetch_sources.sh
+PROTON_RUNTIME_PINNED=0 scripts/proton-runtime/bootstrap_runtime_sources.sh
 ```
 
 To fetch Proton submodules as well:
 
 ```bash
-PROTON_RUNTIME_FETCH_SUBMODULES=1 scripts/proton-runtime/fetch_sources.sh
+PROTON_RUNTIME_FETCH_SUBMODULES=1 scripts/proton-runtime/bootstrap_runtime_sources.sh
 ```
 
 If WSL needs the Windows host proxy:
 
 ```bash
-PROTON_RUNTIME_PROXY=http://172.21.16.1:7897 scripts/proton-runtime/fetch_sources.sh
+PROTON_RUNTIME_PROXY=http://172.21.16.1:7897 scripts/proton-runtime/bootstrap_runtime_sources.sh
 ```
 
 ## Apply The Current Source Patches
@@ -73,6 +82,19 @@ snapshot; they are tracked by pinned upstream commit plus license metadata.
 
 The older `scripts/proton-runtime/apply_hmos_patches.sh` is kept for the
 incremental Box64 compatibility patches used by the app-side build workflow.
+
+Two files often look "missing" before bootstrap:
+
+- `third_party/proton-runtime/src/box64/src/wrapped/wrappedlibc.c` comes from
+  the upstream Box64 checkout.
+- `third_party/proton-runtime/src/box64/src/hmos_inprocess.c` is created by the
+  Aetherium Box64 source patch.
+
+Run this if the upstream checkout exists but the HMOS patch result is missing:
+
+```bash
+scripts/proton-runtime/ensure_runtime_sources.sh box64
+```
 
 ## Audit License Files
 
